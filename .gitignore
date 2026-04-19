@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+*.svo
+*.svo2
+*.avi
+*.mp4
+.vscode/
+Empatica MessUhr/
