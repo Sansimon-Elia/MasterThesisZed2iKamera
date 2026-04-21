@@ -61,7 +61,7 @@ def winkel_farbe(winkel):
 
 def winkel_text(winkel):
     """Feedback-Text für den Patienten"""
-    if winkel >= 150:   return "Gut gestreckt! ✓"
+    if winkel >= 150:   return "Gut gestreckt!"
     elif winkel >= 90:  return "Weiter strecken..."
     else:               return "Mehr strecken!"
 
@@ -120,7 +120,7 @@ def draw_winkel(frame, kps, schulter_idx, ellbogen_idx, handgelenk_idx, seite):
     # Feedback-Text links oben (je nach Seite)
     y_pos = 80 if seite == "Links" else 120
     cv2.putText(frame,
-                f"{seite}: {winkel}° – {text}",
+                f"{seite}: {winkel} Grad _ {text}",
                 (20, y_pos),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7, farbe, 2)
