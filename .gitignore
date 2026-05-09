@@ -7,3 +7,4 @@ __pycache__/
 *.mp4
 .vscode/
 Empatica MessUhr/
+test-gravity-stream.py
