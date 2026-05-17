@@ -25,7 +25,13 @@ control_thread = None
 server_started = threading.Event()
 last_status = "Bereit. Starte die Sphero-Steuerung per Button."
 
-latest_data = {"gx": 0.0, "gy": 0.0, "gz": 0.0}
+latest_data = {
+    "gx":      0.0,
+    "gy":      0.0,
+    "gz":      0.0,
+    "state":   "neutral",   # neu: aktueller Zustand
+    "heading": 0,           # neu: aktuelle Fahrtrichtung
+}
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 MAX_SPEED = 50   # Geschwindigkeit 0-255. Erhöhen = schneller, verringern = langsamer
@@ -108,6 +114,7 @@ def sensorlog():
         latest_data["gx"] = gx
         latest_data["gy"] = gy
         latest_data["gz"] = gz
+        latest_data["state"] = state
 
     return "OK", 200
 
@@ -149,74 +156,101 @@ def stop_sphero_control():
     set_status("Sphero-Steuerung wird gestoppt...")
 
 
+# ── Verbesserte UI ────────────────────────────────────────────────────────────
 def show_controller_ui():
     root = tk.Tk()
-    root.title("Sphero Controller")
-    root.geometry("420x260")
-    root.minsize(380, 240)
+    root.title("Sphero Reha-Controller")
+    root.geometry("440x320")
+    root.minsize(400, 280)
 
-    status_var = tk.StringVar(value=last_status)
-    sensor_var = tk.StringVar(value="gX=0.00 | gY=0.00 | gZ=0.00")
+    status_var  = tk.StringVar(value=last_status)
+    sensor_var  = tk.StringVar(value="Keine Daten")
+    state_var   = tk.StringVar(value="◯  neutral")
+    heading_var = tk.StringVar(value="Heading: 0°")
 
     main = ttk.Frame(root, padding=18)
     main.pack(fill="both", expand=True)
 
-    title = ttk.Label(main, text="Sphero Steuerung", font=("Segoe UI", 16, "bold"))
-    title.pack(anchor="w")
+    ttk.Label(main, text="Sphero Reha-Controller",
+              font=("Segoe UI", 16, "bold")).pack(anchor="w")
 
-    status = ttk.Label(main, textvariable=status_var, wraplength=360)
-    status.pack(anchor="w", pady=(8, 14))
+    ttk.Label(main, textvariable=status_var,
+              wraplength=380).pack(anchor="w", pady=(6, 12))
 
+    # ── Buttons ───────────────────────────────────────────────────────────────
     buttons = ttk.Frame(main)
     buttons.pack(fill="x")
 
-    start_button = ttk.Button(buttons, text="Sphero starten")
-    stop_button = ttk.Button(buttons, text="Sphero stoppen", command=stop_sphero_control)
-    graph_button = ttk.Button(buttons, text="Live Graphen", state="disabled")
-    camera_button = ttk.Button(buttons, text="Kamera", state="disabled")
+    start_button  = ttk.Button(buttons, text="▶  Sphero starten")
+    stop_button   = ttk.Button(buttons, text="■  Sphero stoppen",
+                               command=stop_sphero_control)
+    graph_button  = ttk.Button(buttons, text="📊 Live Graphen", state="disabled")
+    camera_button = ttk.Button(buttons, text="📷 Kamera",       state="disabled")
 
-    start_button.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=4)
-    stop_button.grid(row=0, column=1, sticky="ew", pady=4)
-    graph_button.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=4)
-    camera_button.grid(row=1, column=1, sticky="ew", pady=4)
+    start_button.grid( row=0, column=0, sticky="ew", padx=(0,6), pady=3)
+    stop_button.grid(  row=0, column=1, sticky="ew",             pady=3)
+    graph_button.grid( row=1, column=0, sticky="ew", padx=(0,6), pady=3)
+    camera_button.grid(row=1, column=1, sticky="ew",             pady=3)
     buttons.columnconfigure(0, weight=1)
     buttons.columnconfigure(1, weight=1)
 
-    ttk.Separator(main).pack(fill="x", pady=14)
+    ttk.Separator(main).pack(fill="x", pady=12)
 
-    sensor_label = ttk.Label(main, textvariable=sensor_var)
-    sensor_label.pack(anchor="w")
+    # ── Live Anzeige ──────────────────────────────────────────────────────────
+    info_frame = ttk.Frame(main)
+    info_frame.pack(fill="x")
 
-    hint = ttk.Label(
-        main,
-        text="Die Buttons fuer Live Graphen und Kamera sind vorbereitet und koennen spaeter verbunden werden.",
-        wraplength=360,
-        foreground="#555555",
-    )
-    hint.pack(anchor="w", pady=(10, 0))
+    # Zustand farbig
+    state_label = tk.Label(info_frame, textvariable=state_var,
+                           font=("Segoe UI", 12, "bold"),
+                           fg="#007700", anchor="w")
+    state_label.grid(row=0, column=0, sticky="w")
 
-    def start_clicked():
-        started = start_sphero_control()
-        if started:
-            set_status("Sphero-Steuerung startet. Suche nach Sphero BOLT...")
-        else:
-            set_status("Sphero-Steuerung laeuft bereits.")
+    ttk.Label(info_frame, textvariable=heading_var,
+              font=("Segoe UI", 11)).grid(row=0, column=1, sticky="e", padx=(20,0))
+
+    ttk.Label(info_frame, textvariable=sensor_var,
+              font=("Consolas", 9),
+              foreground="#555555").grid(row=1, column=0, columnspan=2,
+                                        sticky="w", pady=(4,0))
+
+    info_frame.columnconfigure(0, weight=1)
+
+    # ── Farben je nach Zustand ────────────────────────────────────────────────
+    STATE_COLORS = {
+        "forward":  ("#007700", "▶  vorwärts"),
+        "right":    ("#cc5500", "↻  rechts"),
+        "left":     ("#0055cc", "↺  links"),
+        "neutral":  ("#888888", "◯  neutral"),
+    }
 
     def refresh_ui():
         with lock:
-            gx = latest_data["gx"]
-            gy = latest_data["gy"]
-            gz = latest_data["gz"]
+            gx      = latest_data["gx"]
+            gy      = latest_data["gy"]
+            gz      = latest_data["gz"]
+            state   = latest_data["state"]
+            heading = latest_data["heading"]
             status_text = last_status
 
-        sensor_var.set(f"gX={gx:+.2f} | gY={gy:+.2f} | gZ={gz:+.2f}")
+        sensor_var.set(f"gX={gx:+.2f}  gY={gy:+.2f}  gZ={gz:+.2f}")
         status_var.set(status_text)
+        heading_var.set(f"Heading: {int(heading)}°")
+
+        color, label = STATE_COLORS.get(state, ("#888888", "◯  neutral"))
+        state_var.set(label)
+        state_label.config(fg=color)
 
         is_running = control_thread is not None and control_thread.is_alive()
         start_button.config(state="disabled" if is_running else "normal")
-        stop_button.config(state="normal" if is_running else "disabled")
+        stop_button.config( state="normal"   if is_running else "disabled")
 
-        root.after(250, refresh_ui)
+        root.after(200, refresh_ui)
+
+    def start_clicked():
+        started = start_sphero_control()
+        set_status("Sphero-Steuerung startet. Suche nach Sphero BOLT..." if started
+                   else "Sphero-Steuerung läuft bereits.")
 
     def on_close():
         stop_sphero_control()
@@ -279,6 +313,8 @@ def control_sphero():
                 sphero.set_main_led(Color(r=255, g=100, b=0))  # Orange
                 last_move_time = time.time()
                 is_stopped     = False
+                with lock:
+                    latest_data["heading"] = sphero_heading  # 
 
             elif state == "left":
                 # Heading -3° pro Schritt nach links drehen und fahren
@@ -287,6 +323,8 @@ def control_sphero():
                 sphero.set_main_led(Color(r=0, g=200, b=255))  # Cyan
                 last_move_time = time.time()
                 is_stopped     = False
+                with lock:
+                    latest_data["heading"] = sphero_heading  # ← neu
 
             elif state == "forward":
                 sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
