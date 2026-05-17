@@ -1,7 +1,10 @@
 from flask import Flask, request
+import asyncio
 import threading
 import time
 import logging
+import tkinter as tk
+from tkinter import ttk
 from spherov2 import scanner
 from spherov2.sphero_edu import SpheroEduAPI
 from spherov2.types import Color
@@ -11,9 +14,16 @@ log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
 
+if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 lock       = threading.Lock()
 stop_event = threading.Event()
 sphero_api = None
+server_thread = None
+control_thread = None
+server_started = threading.Event()
+last_status = "Bereit. Starte die Sphero-Steuerung per Button."
 
 latest_data = {"gx": 0.0, "gy": 0.0, "gz": 0.0}
 
@@ -92,7 +102,7 @@ def sensorlog():
     gz = float(data.get("gravityZ", 0))
 
     state = get_state(gx, gy, gz)
-    print(f"gX={gx:+.2f} | gY={gy:+.2f} | gZ={gz:+.2f} → {state}")
+    print(f"gX={gx:+.2f} | gY={gy:+.2f} | gZ={gz:+.2f} -> {state}")
 
     with lock:
         latest_data["gx"] = gx
@@ -106,16 +116,137 @@ def run_server():
     app.run(host='0.0.0.0', port=56671, debug=False)
 
 
+def set_status(message):
+    global last_status
+    with lock:
+        last_status = message
+
+
+def start_server_once():
+    global server_thread
+    if server_started.is_set():
+        return
+
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    server_started.set()
+
+
+def start_sphero_control():
+    global control_thread
+    if control_thread and control_thread.is_alive():
+        return False
+
+    stop_event.clear()
+    start_server_once()
+    control_thread = threading.Thread(target=control_sphero, daemon=True)
+    control_thread.start()
+    return True
+
+
+def stop_sphero_control():
+    stop_event.set()
+    set_status("Sphero-Steuerung wird gestoppt...")
+
+
+def show_controller_ui():
+    root = tk.Tk()
+    root.title("Sphero Controller")
+    root.geometry("420x260")
+    root.minsize(380, 240)
+
+    status_var = tk.StringVar(value=last_status)
+    sensor_var = tk.StringVar(value="gX=0.00 | gY=0.00 | gZ=0.00")
+
+    main = ttk.Frame(root, padding=18)
+    main.pack(fill="both", expand=True)
+
+    title = ttk.Label(main, text="Sphero Steuerung", font=("Segoe UI", 16, "bold"))
+    title.pack(anchor="w")
+
+    status = ttk.Label(main, textvariable=status_var, wraplength=360)
+    status.pack(anchor="w", pady=(8, 14))
+
+    buttons = ttk.Frame(main)
+    buttons.pack(fill="x")
+
+    start_button = ttk.Button(buttons, text="Sphero starten")
+    stop_button = ttk.Button(buttons, text="Sphero stoppen", command=stop_sphero_control)
+    graph_button = ttk.Button(buttons, text="Live Graphen", state="disabled")
+    camera_button = ttk.Button(buttons, text="Kamera", state="disabled")
+
+    start_button.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=4)
+    stop_button.grid(row=0, column=1, sticky="ew", pady=4)
+    graph_button.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=4)
+    camera_button.grid(row=1, column=1, sticky="ew", pady=4)
+    buttons.columnconfigure(0, weight=1)
+    buttons.columnconfigure(1, weight=1)
+
+    ttk.Separator(main).pack(fill="x", pady=14)
+
+    sensor_label = ttk.Label(main, textvariable=sensor_var)
+    sensor_label.pack(anchor="w")
+
+    hint = ttk.Label(
+        main,
+        text="Die Buttons fuer Live Graphen und Kamera sind vorbereitet und koennen spaeter verbunden werden.",
+        wraplength=360,
+        foreground="#555555",
+    )
+    hint.pack(anchor="w", pady=(10, 0))
+
+    def start_clicked():
+        started = start_sphero_control()
+        if started:
+            set_status("Sphero-Steuerung startet. Suche nach Sphero BOLT...")
+        else:
+            set_status("Sphero-Steuerung laeuft bereits.")
+
+    def refresh_ui():
+        with lock:
+            gx = latest_data["gx"]
+            gy = latest_data["gy"]
+            gz = latest_data["gz"]
+            status_text = last_status
+
+        sensor_var.set(f"gX={gx:+.2f} | gY={gy:+.2f} | gZ={gz:+.2f}")
+        status_var.set(status_text)
+
+        is_running = control_thread is not None and control_thread.is_alive()
+        start_button.config(state="disabled" if is_running else "normal")
+        stop_button.config(state="normal" if is_running else "disabled")
+
+        root.after(250, refresh_ui)
+
+    def on_close():
+        stop_sphero_control()
+        root.destroy()
+
+    start_button.config(command=start_clicked)
+    stop_button.config(state="disabled")
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    refresh_ui()
+    root.mainloop()
+
+
 # ── Sphero Steuerung ──────────────────────────────────────────────────────────
 def control_sphero():
     global sphero_api
-    print("🔍 Suche Sphero BOLT...")
-    toy = scanner.find_toy()
-    if not toy:
-        print("❌ Kein Sphero gefunden!")
-        return
+    try:
+        print("[INFO] Suche Sphero BOLT...")
+        set_status("Suche Sphero BOLT...")
+        toy = scanner.find_toy()
+        if not toy:
+            print("[FEHLER] Kein Sphero gefunden!")
+            set_status("Kein Sphero gefunden. Bitte Bluetooth und Sphero pruefen.")
+            return
 
-    print("✅ Sphero verbunden!")
+        print("[OK] Sphero verbunden!")
+        set_status("Sphero verbunden. Sensor-App kann Daten an /sensorlog senden.")
+    except Exception as error:
+        print(f"[FEHLER] Sphero-Start fehlgeschlagen: {error}")
+        set_status(f"Sphero-Start fehlgeschlagen: {error}")
+        return
 
     with SpheroEduAPI(toy) as sphero:
         sphero_api     = sphero
@@ -125,11 +256,11 @@ def control_sphero():
 
         sphero.set_heading(0)
         sphero.set_main_led(Color(r=255, g=255, b=255))  # Weiß = bereit
-        print("\n✅ Bereit! Steuerung:")
+        print("\n[OK] Bereit! Steuerung:")
         print("   Hand nach unten  = Neutral/Stopp")
-        print("   Hand flach vorne = Vorwärts  🟢")
-        print("   Uhr nach rechts  = Rechts    🟠")
-        print("   Uhr nach links   = Links     🔵\n")
+        print("   Hand flach vorne = Vorwaerts")
+        print("   Uhr nach rechts  = Rechts")
+        print("   Uhr nach links   = Links\n")
 
         while not stop_event.is_set():
             with lock:
@@ -169,26 +300,25 @@ def control_sphero():
                     sphero.stop_roll(int(sphero_heading))
                     sphero.set_main_led(Color(r=255, g=0, b=0))  # Rot
                     is_stopped = True
-                    print("⏸️  Auto-Stopp")
+                    print("[STOPP] Auto-Stopp")
 
             time.sleep(0.05)
 
         # Sauber beenden
-        print("\n🔌 Trenne Sphero...")
+        print("\n[INFO] Trenne Sphero...")
         try:
             sphero.stop_roll(0)
             sphero.set_main_led(Color(r=0, g=0, b=0))
             time.sleep(0.5)
         except Exception:
             pass
-        print("✅ Getrennt.")
+        print("[OK] Getrennt.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=run_server, daemon=True).start()
     try:
-        control_sphero()
+        show_controller_ui()
     except KeyboardInterrupt:
-        print("\n⛔ Beende...")
+        print("\n[STOPP] Beende...")
         stop_event.set()
