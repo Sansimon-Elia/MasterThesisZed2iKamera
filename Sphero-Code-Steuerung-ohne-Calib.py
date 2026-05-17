@@ -60,6 +60,15 @@ GX_FORWARD_MAX = +0.1
 # → Erhöhe auf +0.85 wenn Normal zu schwer zu erkennen ist
 GX_NEUTRAL_THRESHOLD = +0.12
 
+MAX_TURN_ANGLE = 90   # Grad bei voller Handdrehung (gY=±1.0)
+                      # → Erhöhe für schärfere Kurven (z.B. 120)
+                      # → Verringere für sanftere Kurven (z.B. 45)
+
+TURN_DEADZONE = 0.80  # Ab wann Kurve beginnt – muss gleich wie GY_RIGHT/LEFT_THRESHOLD sein
+                      # → Erhöhe wenn Kurve zu früh startet
+                      # → Verringere wenn Kurve zu spät startet
+
+
 
 # ── Zustandserkennung – rein aus Messdaten ────────────────────────────────────
 def get_state(gx, gy, gz):
@@ -94,6 +103,21 @@ def get_state(gx, gy, gz):
 
     # Alles andere = neutral (Übergangsbewegungen)
     return "neutral"
+
+# ── Hilfsfunktion für proportionale Kurve ────────────────────────────────────
+def calc_turn(gy_value):
+    """
+    Berechnet Kurvenwinkel proportional zur Handdrehung.
+    
+    gY = -0.80 (Schwelle)  → intensity=0.0 → turn=0°
+    gY = -0.90 (mittel)    → intensity=0.5 → turn=45°
+    gY = -1.00 (Maximum)   → intensity=1.0 → turn=90°
+    
+    Erhöhe MAX_TURN_ANGLE für schärfere Kurven.
+    """
+    intensity = (abs(gy_value) - TURN_DEADZONE) / (1.0 - TURN_DEADZONE)
+    intensity = max(0.0, min(1.0, intensity))   # Begrenzen auf 0-1
+    return intensity * MAX_TURN_ANGLE
 
 
 # ── Flask Route ───────────────────────────────────────────────────────────────
@@ -305,26 +329,25 @@ def control_sphero():
             state = get_state(gx, gy, gz)
 
             if state == "right":
-                # Heading +3° pro Schritt nach rechts drehen und fahren
-                # Erhöhe 3 auf 5 wenn Kurve zu langsam
-                # Verringere auf 2 wenn Kurve zu abrupt
-                sphero_heading = (sphero_heading + 10) % 360
+                turn = calc_turn(gy)
+                sphero_heading = (sphero_heading + turn) % 360
                 sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
-                sphero.set_main_led(Color(r=255, g=100, b=0))  # Orange
+                sphero.set_main_led(Color(r=255, g=100, b=0))
                 last_move_time = time.time()
                 is_stopped     = False
                 with lock:
-                    latest_data["heading"] = sphero_heading  # 
+                 latest_data["heading"] = sphero_heading
+
 
             elif state == "left":
-                # Heading -3° pro Schritt nach links drehen und fahren
-                sphero_heading = (sphero_heading - 10) % 360
+                turn = calc_turn(gy)   # abs() ist schon in calc_turn drin
+                sphero_heading = (sphero_heading - turn) % 360
                 sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
-                sphero.set_main_led(Color(r=0, g=200, b=255))  # Cyan
+                sphero.set_main_led(Color(r=0, g=200, b=255))
                 last_move_time = time.time()
                 is_stopped     = False
                 with lock:
-                    latest_data["heading"] = sphero_heading  # ← neu
+                    latest_data["heading"] = sphero_heading
 
             elif state == "forward":
                 sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
