@@ -34,7 +34,19 @@ latest_data = {
 }
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
-MAX_SPEED = 50   # Geschwindigkeit 0-255. Erhöhen = schneller, verringern = langsamer
+#MAX_SPEED = 50   # Geschwindigkeit 0-255. Erhöhen = schneller, verringern = langsamer
+
+# ── Dynamische Geschwindigkeit über Handhöhe ──────────────────────────────────
+MIN_SPEED_DYN = 30    # Mindestgeschwindigkeit wenn Hand flach (gX ≈ 0)
+                      # → Erhöhe wenn Sphero zu langsam bei flacher Hand
+MAX_SPEED_DYN = 120   # Maximalgeschwindigkeit wenn Hand hoch (gX ≈ -0.95)
+                      # → Verringere wenn Topgeschwindigkeit zu schnell ist
+
+TURN_SPEED_FACTOR = 0.6   # Geschwindigkeit während Kurve = calc_speed × 0.6
+                           # → 0.5 = halbe Geschwindigkeit (smoother)
+                           # → 0.8 = 80% Geschwindigkeit (weniger Abbremsung)
+                           # → 1.0 = keine Abbremsung
+
 STOP_TIME = 1.5  # Sekunden bis Auto-Stopp. Verringern = schneller stoppen
 
 # ── Schwellenwerte (aus deinen echten Messdaten) ──────────────────────────────
@@ -49,10 +61,11 @@ GY_RIGHT_THRESHOLD = -0.80
 GY_LEFT_THRESHOLD = +0.80
 
 # VORWÄRTS: gZ sinkt auf ca. -0.96, gX wird negativ ca. -0.17
-# → gZ: Verringere -0.75 auf -0.85 wenn Vorwärts zu leicht auslöst
-# → gZ: Erhöhe auf -0.65 wenn Vorwärts zu schwer auszulösen ist
+# → gZ wird nicht mehr als harte Forward-Bedingung genutzt, weil die Hand
+#   bei höherer Haltung sonst fälschlich in Neutral fallen kann.
 GZ_FORWARD_THRESHOLD = -0.9
-# → gX: Verringere -0.05 weiter wenn Normal fälschlich als Vorwärts erkannt
+# → gX: Verringere +0.10 weiter wenn Vorwärts zu leicht auslöst
+# → gX: Erhöhe +0.10 wenn Vorwärts zu schwer auszulösen ist
 GX_FORWARD_MAX = +0.1
 
 # NORMAL/UNTEN: gX steigt auf ca. +0.95
@@ -96,13 +109,32 @@ def get_state(gx, gy, gz):
     if gx > GX_NEUTRAL_THRESHOLD:
         return "neutral"
 
-    # VORWÄRTS: gZ stark negativ UND gX negativ = Hand flach nach vorne
-    # Deine Werte: gZ ≈ -0.96, gX ≈ -0.17
-    if gz < GZ_FORWARD_THRESHOLD and gx < GX_FORWARD_MAX:
+    # VORWÄRTS: gX niedrig genug = Hand zeigt nach vorne/oben.
+    # gZ wird absichtlich nicht hart geprüft, weil es bei höherer Hand
+    # weniger negativ werden kann und sonst fälschlich Neutral auslöst.
+    if gx < GX_FORWARD_MAX:
         return "forward"
 
     # Alles andere = neutral (Übergangsbewegungen)
     return "neutral"
+
+
+#dynamische Geschwindigkei anhand gx 
+def calc_speed(gx):
+    """
+    gX = +0.10 (flach/neutral) → MIN_SPEED_DYN (30)
+    gX =  0.00 (mittig)        → ~55
+    gX = -0.50 (halb hoch)     → ~75
+    gX = -0.95 (ganz hoch)     → MAX_SPEED_DYN (120)
+
+    Erhöhe MAX_SPEED_DYN für mehr Topgeschwindigkeit.
+    Erhöhe MIN_SPEED_DYN wenn Sphero bei flacher Hand zu langsam ist.
+    """
+    # Normierung: +0.10 (flach) bis -0.95 (hoch) → 0.0 bis 1.0
+    intensity = (0.10 - gx) / (0.10 - (-0.95))
+    intensity = max(0.0, min(1.0, intensity))
+    return int(MIN_SPEED_DYN + intensity * (MAX_SPEED_DYN - MIN_SPEED_DYN))
+
 
 # ── Hilfsfunktion für proportionale Kurve ────────────────────────────────────
 def calc_turn(gy_value):
@@ -329,20 +361,22 @@ def control_sphero():
             state = get_state(gx, gy, gz)
 
             if state == "right":
-                turn = calc_turn(gy)
+                turn  = calc_turn(gy)
+                speed = int(calc_speed(gx) * TURN_SPEED_FACTOR)  # 60% der aktuellen Geschwindigkeit
                 sphero_heading = (sphero_heading + turn) % 360
-                sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
+                sphero.roll(int(sphero_heading), speed, 0.1)
                 sphero.set_main_led(Color(r=255, g=100, b=0))
                 last_move_time = time.time()
                 is_stopped     = False
                 with lock:
-                 latest_data["heading"] = sphero_heading
+                    latest_data["heading"] = sphero_heading
 
 
             elif state == "left":
-                turn = calc_turn(gy)   # abs() ist schon in calc_turn drin
+                turn  = calc_turn(gy)
+                speed = int(calc_speed(gx) * TURN_SPEED_FACTOR)  # 60% der aktuellen Geschwindigkeit
                 sphero_heading = (sphero_heading - turn) % 360
-                sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
+                sphero.roll(int(sphero_heading), speed, 0.1)
                 sphero.set_main_led(Color(r=0, g=200, b=255))
                 last_move_time = time.time()
                 is_stopped     = False
@@ -350,8 +384,9 @@ def control_sphero():
                     latest_data["heading"] = sphero_heading
 
             elif state == "forward":
-                sphero.roll(int(sphero_heading), MAX_SPEED, 0.1)
-                sphero.set_main_led(Color(r=0, g=255, b=0))    # Grün
+                speed = calc_speed(gx)   # volle dynamische Geschwindigkeit
+                sphero.roll(int(sphero_heading), speed, 0.1)
+                sphero.set_main_led(Color(r=0, g=255, b=0))
                 last_move_time = time.time()
                 is_stopped     = False
 
