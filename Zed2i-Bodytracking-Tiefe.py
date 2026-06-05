@@ -1,6 +1,13 @@
 import pyzed.sl as sl
 import cv2
 import numpy as np
+from gtts import gTTS
+import pygame
+import tempfile
+import os
+import threading
+import time
+
 
 WICHTIGE_PUNKTE = {
     11, 2,
@@ -32,6 +39,43 @@ BODY_CONNECTIONS = [
     (6, 8),
     (13, 15),
 ]
+
+
+# Audio einmalig initialisieren
+pygame.mixer.init()
+
+letztes_feedback = {
+    "zu_nah":  0,
+    "zu_weit": 0,
+}
+FEEDBACK_PAUSE = 5
+
+def sprich(text, kategorie):
+    jetzt = time.time()
+    if jetzt - letztes_feedback[kategorie] > FEEDBACK_PAUSE:
+        letztes_feedback[kategorie] = jetzt
+        def sprechen():
+            try:
+                # Text zu Audio konvertieren
+                tts = gTTS(text=text, lang='de')
+                # Temporäre Datei speichern
+                tmp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix='.mp3'
+                )
+                tmp.close()
+                tts.save(tmp.name)
+                # Abspielen
+                pygame.mixer.music.load(tmp.name)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+                pygame.mixer.music.unload()   # ← NEU
+                time.sleep(0.1)               # ← kurz warten
+                # Aufräumen
+                os.unlink(tmp.name)
+            except Exception as ex:
+                print(f"Sprache Fehler: {ex}")
+        threading.Thread(target=sprechen, daemon=True).start()
 
 def berechne_winkel_3d(p1, p2, p3):
     """3D Winkel mit X, Y, Z – präziser als 2D"""
@@ -139,23 +183,22 @@ def draw_winkel(frame, kps_2d, kps_3d, schulter_idx, ellbogen_idx, handgelenk_id
                 0.7, farbe, 2)
 
 def draw_abstand(frame, kps_3d):
-    """Abstand zur Kamera oben rechts anzeigen"""
-    # Brust (Punkt 2) als Referenzpunkt
     abstand = berechne_abstand(kps_3d[2])
     if abstand is None:
         return
 
-    h, w = frame.shape[:2]
-
-    # Farbe je nach Abstand
     if abstand < 1.0:
-        farbe = (0, 0, 255)      # Rot – zu nah
-        hinweis = "Zu nah!"
+        farbe   = COLOR_BAD
+        hinweis = "Zu nah _ Bitte zuruecktreten"
+        sprich("Bitte treten Sie zurueck", "zu_nah")  # ← kategorie
+
     elif abstand > 3.5:
-        farbe = (0, 165, 255)    # Orange – zu weit
-        hinweis = "Zu weit!"
+        farbe   = COLOR_WARNING
+        hinweis = "Zu weit _ Bitte naeher treten"
+        sprich("Bitte treten Sie naeher", "zu_weit")  # ← kategorie
+
     else:
-        farbe = (0, 255, 0)      # Grün – optimaler Abstand
+        farbe   = COLOR_GOOD
         hinweis = "Abstand OK"
 
     cv2.putText(frame,
