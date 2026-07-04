@@ -359,9 +359,49 @@ _BODY_CONNECTIONS = [
     (12, 13), (5, 6), (6, 8), (13, 15),
 ]
 
-_letztes_feedback = {"zu_nah": 0, "zu_weit": 0}
-_FEEDBACK_PAUSE   = 5
-_pygame_ready     = False
+_pygame_ready = False
+
+# ── Adaptives Audio-Feedback ──────────────────────────────────────────────────
+# Wissenschaftlicher Hintergrund:
+#   Schmidt, R.A. & Lee, T.D. (2011). Motor Control and Learning (5th ed.).
+#   Human Kinetics. → "Guidance Hypothesis": zu häufiges Feedback erzeugt
+#   Abhängigkeit und reduziert den Lerneffekt.
+#   Winstein & Schmidt (1990). J. Exp. Psychol.: Learn. Mem. Cogn., 16(4),
+#   677-691. → Seltenereres Feedback verbessert motorisches Lernen.
+#
+# Implementierung: Exponentieller Backoff + Phrasen-Variation
+#   - Intervall verdoppelt sich nach jeder Meldung (5s → 10s → 20s → 60s max)
+#   - Mehrere Formulierungen rotieren, um Gewöhnung zu vermeiden
+#   - Intervall wird zurückgesetzt wenn der Zustand sich ändert
+
+_FEEDBACK_MIN_INTERVAL = 5.0    # Sekunden – erstes Feedback
+_FEEDBACK_MAX_INTERVAL = 60.0   # Sekunden – maximales Intervall
+_FEEDBACK_BACKOFF      = 2.0    # Multiplikator nach jeder Wiedergabe
+
+_FEEDBACK_PHRASES = {
+    "zu_nah": [
+        "Bitte treten Sie zurueck",
+        "Sie stehen zu nah. Bitte etwas Abstand halten",
+        "Bitte einen Schritt zuruecktreten",
+    ],
+    "zu_weit": [
+        "Bitte treten Sie naeher",
+        "Sie stehen zu weit entfernt. Bitte naeher kommen",
+        "Bitte einen Schritt nach vorne treten",
+    ],
+}
+
+_feedback_state = {
+    "zu_nah":  {"last_time": 0.0, "interval": _FEEDBACK_MIN_INTERVAL, "phrase_idx": 0},
+    "zu_weit": {"last_time": 0.0, "interval": _FEEDBACK_MIN_INTERVAL, "phrase_idx": 0},
+}
+_last_distance_condition = "ok"
+
+
+def _reset_feedback(kategorie: str):
+    """Intervall zurücksetzen wenn Zustand neu eintritt."""
+    _feedback_state[kategorie]["interval"]   = _FEEDBACK_MIN_INTERVAL
+    _feedback_state[kategorie]["phrase_idx"] = 0
 
 
 def _init_audio():
@@ -374,11 +414,21 @@ def _init_audio():
         _pygame_ready = False
 
 
-def _sprich(text: str, kategorie: str):
+def _sprich(kategorie: str):
+    """
+    Spielt Feedback mit exponentiellem Backoff und Phrasen-Rotation ab.
+    Intervall: 5s → 10s → 20s → 40s → 60s (Deckel).
+    """
+    state = _feedback_state[kategorie]
     jetzt = time.time()
-    if jetzt - _letztes_feedback[kategorie] <= _FEEDBACK_PAUSE:
+    if jetzt - state["last_time"] < state["interval"]:
         return
-    _letztes_feedback[kategorie] = jetzt
+
+    phrases  = _FEEDBACK_PHRASES[kategorie]
+    text     = phrases[state["phrase_idx"] % len(phrases)]
+    state["phrase_idx"] += 1
+    state["last_time"]   = jetzt
+    state["interval"]    = min(state["interval"] * _FEEDBACK_BACKOFF, _FEEDBACK_MAX_INTERVAL)
 
     def sprechen():
         try:
@@ -469,28 +519,37 @@ def _draw_winkel(frame, kps_2d, kps_3d, schulter_idx, ellbogen_idx, handgelenk_i
     cv2.circle(frame, (ex, ey), 14, (255, 255, 255), 2)
     cv2.putText(frame, f"{winkel}", (ex - 20, ey - 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    cv2.putText(frame, f"{seite}: {winkel} Grad – {_winkel_text(winkel)}",
+    cv2.putText(frame, f"{seite}: {winkel} Grad _ {_winkel_text(winkel)}",
                 (20, 80 if seite == "Links" else 120),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, farbe, 2)
 
 
 def _draw_abstand(frame, kps_3d, cv2):
+    global _last_distance_condition
     p = kps_3d[2]
     if p[2] <= 0:
         return
-    abstand = round(p[2], 2)
+    abstand = p[2]
     if abstand < 1.0:
-        farbe   = _COLOR_BAD
-        hinweis = "Zu nah – Bitte zurücktreten"
-        _sprich("Bitte treten Sie zurück", "zu_nah")
+        neue_bedingung = "zu_nah"
+        farbe          = _COLOR_BAD
+        hinweis        = "Zu nah _ Bitte zuruecktreten"
+        if _last_distance_condition != "zu_nah":
+            _reset_feedback("zu_nah")
+        _sprich("zu_nah")
     elif abstand > 3.5:
-        farbe   = _COLOR_WARNING
-        hinweis = "Zu weit – Bitte näher treten"
-        _sprich("Bitte treten Sie näher", "zu_weit")
+        neue_bedingung = "zu_weit"
+        farbe          = _COLOR_WARNING
+        hinweis        = "Zu weit _ Bitte naeher treten"
+        if _last_distance_condition != "zu_weit":
+            _reset_feedback("zu_weit")
+        _sprich("zu_weit")
     else:
-        farbe   = _COLOR_GOOD
-        hinweis = "Abstand OK"
-    cv2.putText(frame, f"Abstand: {abstand}m – {hinweis}",
+        neue_bedingung = "ok"
+        farbe          = _COLOR_GOOD
+        hinweis        = "Abstand OK"
+    _last_distance_condition = neue_bedingung
+    cv2.putText(frame, f"Abstand: {abstand:.2f}m _ {hinweis}",
                 (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, farbe, 2)
 
 
