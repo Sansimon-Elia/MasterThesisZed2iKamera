@@ -179,80 +179,142 @@ def start_server_once():
 # Sphero Steuerung
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_connection_error(exc: Exception) -> bool:
+    """Erkennt BleakError 'Not connected' und concurrent.futures.TimeoutError."""
+    if isinstance(exc, TimeoutError):
+        return True
+    msg = str(exc).lower()
+    return "not connected" in msg or "bleakerror" in msg or "timeout" in msg
+
+
 def control_sphero():
     global sphero_api
-    try:
-        set_status("Suche Sphero BOLT...")
-        toy = scanner.find_toy()
-        if not toy:
-            set_status("Kein Sphero gefunden. Bluetooth und Sphero prüfen.")
-            return
-        set_status("Sphero verbunden. Sensor-App kann Daten senden.")
-    except Exception as e:
-        set_status(f"Sphero-Start fehlgeschlagen: {e}")
-        return
 
-    with SpheroEduAPI(toy) as sphero:
-        sphero_api     = sphero
-        sphero_heading = 0
-        last_move_time = time.time()
-        is_stopped     = True
+    MAX_RECONNECTS   = 5
+    RECONNECT_DELAY  = 3.0   # Sekunden zwischen Reconnect-Versuchen
+    reconnect_count  = 0
+    sphero_heading   = 0     # Heading über Reconnects hinweg behalten
 
-        sphero.set_heading(0)
-        sphero.set_main_led(Color(r=255, g=255, b=255))
+    while not stop_sphero.is_set() and reconnect_count <= MAX_RECONNECTS:
 
-        while not stop_sphero.is_set():
-            with data_lock:
-                gx = latest_data["gx"]
-                gy = latest_data["gy"]
-                gz = latest_data["gz"]
-
-            state = get_state(gx, gy, gz)
-
-            if state == "right":
-                turn           = calc_turn(gy)
-                speed          = int(calc_speed(gx) * TURN_SPEED_FACTOR)
-                sphero_heading = (sphero_heading + turn) % 360
-                sphero.roll(int(sphero_heading), speed, 0.1)
-                sphero.set_main_led(Color(r=255, g=100, b=0))
-                last_move_time = time.time()
-                is_stopped     = False
-                with data_lock:
-                    latest_data["heading"] = sphero_heading
-
-            elif state == "left":
-                turn           = calc_turn(gy)
-                speed          = int(calc_speed(gx) * TURN_SPEED_FACTOR)
-                sphero_heading = (sphero_heading - turn) % 360
-                sphero.roll(int(sphero_heading), speed, 0.1)
-                sphero.set_main_led(Color(r=0, g=200, b=255))
-                last_move_time = time.time()
-                is_stopped     = False
-                with data_lock:
-                    latest_data["heading"] = sphero_heading
-
-            elif state == "forward":
-                speed = calc_speed(gx)
-                sphero.roll(int(sphero_heading), speed, 0.1)
-                sphero.set_main_led(Color(r=0, g=255, b=0))
-                last_move_time = time.time()
-                is_stopped     = False
-
-            elif state == "neutral":
-                if not is_stopped and time.time() - last_move_time > STOP_TIME:
-                    sphero.stop_roll(int(sphero_heading))
-                    sphero.set_main_led(Color(r=255, g=0, b=0))
-                    is_stopped = True
-
-            time.sleep(0.05)
+        # ── Verbinden ─────────────────────────────────────────────────────────
+        if reconnect_count == 0:
+            set_status("Suche Sphero BOLT...")
+        else:
+            set_status(f"Reconnect {reconnect_count}/{MAX_RECONNECTS} – suche Sphero...")
 
         try:
-            sphero.stop_roll(0)
-            sphero.set_main_led(Color(r=0, g=0, b=0))
-            time.sleep(0.5)
-        except Exception:
-            pass
-        set_status("Sphero getrennt.")
+            toy = scanner.find_toy()
+            if not toy:
+                set_status("Kein Sphero gefunden. Bluetooth und Sphero prüfen.")
+                return
+        except Exception as e:
+            set_status(f"Sphero-Start fehlgeschlagen: {e}")
+            return
+
+        # ── Steuerungs-Loop ───────────────────────────────────────────────────
+        connection_lost = False
+        try:
+            with SpheroEduAPI(toy) as sphero:
+                sphero_api     = sphero
+                last_move_time = time.time()
+                is_stopped     = True
+
+                sphero.set_heading(sphero_heading)
+                sphero.set_main_led(Color(r=255, g=255, b=255))
+
+                if reconnect_count == 0:
+                    set_status("Sphero verbunden. Sensor-App kann Daten senden.")
+                else:
+                    set_status(f"Sphero wieder verbunden (Versuch {reconnect_count}).")
+                reconnect_count = 0  # bei Erfolg zurücksetzen
+
+                while not stop_sphero.is_set():
+                    with data_lock:
+                        gx = latest_data["gx"]
+                        gy = latest_data["gy"]
+                        gz = latest_data["gz"]
+
+                    state = get_state(gx, gy, gz)
+
+                    try:
+                        if state == "right":
+                            turn           = calc_turn(gy)
+                            speed          = int(calc_speed(gx) * TURN_SPEED_FACTOR)
+                            sphero_heading = (sphero_heading + turn) % 360
+                            sphero.roll(int(sphero_heading), speed, 0.1)
+                            sphero.set_main_led(Color(r=255, g=100, b=0))
+                            last_move_time = time.time()
+                            is_stopped     = False
+                            with data_lock:
+                                latest_data["heading"] = sphero_heading
+
+                        elif state == "left":
+                            turn           = calc_turn(gy)
+                            speed          = int(calc_speed(gx) * TURN_SPEED_FACTOR)
+                            sphero_heading = (sphero_heading - turn) % 360
+                            sphero.roll(int(sphero_heading), speed, 0.1)
+                            sphero.set_main_led(Color(r=0, g=200, b=255))
+                            last_move_time = time.time()
+                            is_stopped     = False
+                            with data_lock:
+                                latest_data["heading"] = sphero_heading
+
+                        elif state == "forward":
+                            speed = calc_speed(gx)
+                            sphero.roll(int(sphero_heading), speed, 0.1)
+                            sphero.set_main_led(Color(r=0, g=255, b=0))
+                            last_move_time = time.time()
+                            is_stopped     = False
+
+                        elif state == "neutral":
+                            if not is_stopped and time.time() - last_move_time > STOP_TIME:
+                                sphero.stop_roll(int(sphero_heading))
+                                sphero.set_main_led(Color(r=255, g=0, b=0))
+                                is_stopped = True
+
+                    except Exception as e:
+                        if _is_connection_error(e):
+                            connection_lost = True
+                            break
+                        # Andere Fehler: loggen, aber weiterlaufen
+                        print(f"[WARN] Sphero-Befehl fehlgeschlagen: {e}")
+
+                    time.sleep(0.05)
+
+                # Sauber beenden wenn gewollt gestoppt
+                if not connection_lost:
+                    try:
+                        sphero.stop_roll(0)
+                        sphero.set_main_led(Color(r=0, g=0, b=0))
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            if _is_connection_error(e):
+                connection_lost = True
+            else:
+                set_status(f"Sphero-Fehler: {e}")
+                return
+
+        # ── Verbindungsverlust behandeln ──────────────────────────────────────
+        if connection_lost and not stop_sphero.is_set():
+            reconnect_count += 1
+            if reconnect_count <= MAX_RECONNECTS:
+                set_status(
+                    f"Verbindung verloren! Reconnect in {int(RECONNECT_DELAY)}s "
+                    f"({reconnect_count}/{MAX_RECONNECTS})..."
+                )
+                time.sleep(RECONNECT_DELAY)
+            else:
+                set_status(
+                    f"Verbindung nach {MAX_RECONNECTS} Versuchen verloren. "
+                    "Sphero bitte neu starten und erneut verbinden."
+                )
+                return
+
+    set_status("Sphero getrennt.")
 
 
 def start_sphero_control() -> bool:
