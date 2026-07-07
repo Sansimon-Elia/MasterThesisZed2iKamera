@@ -52,6 +52,7 @@ last_status     = "Bereit. Starte die Sphero-Steuerung per Button."
 latest_data = {
     "gx": 0.0, "gy": 0.0, "gz": 0.0,
     "state": "neutral", "heading": 0,
+    "backward_until": 0.0,
 }
 
 # Live-Graph-Daten
@@ -72,6 +73,8 @@ GX_FORWARD_MAX       = +0.1
 GX_NEUTRAL_THRESHOLD = +0.12
 MAX_TURN_ANGLE       = 90
 TURN_DEADZONE        = 0.80
+BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
+BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
 
 # ── Live-Graph-Konfiguration ─────────────────────────────────────────────────
 HR_WARN    = 100
@@ -135,6 +138,13 @@ def sensorlog():
     data = request.json
     if data is None:
         return "No data", 400
+    
+    # ── NEU: Double Tap ist ein reiner Event-POST ohne Sensordaten ──
+    if data.get("doubleTap"):
+        with data_lock:
+            latest_data["backward_until"] = time.time() + BACKWARD_DURATION
+        print("[EVENT] Double Tap → Rückwärts")
+        return "OK", 200          # ← wichtig: hier beenden!
 
     # Sphero-Steuerung (Schwerkraft)
     gx    = float(data.get("gravityX", 0))
@@ -231,9 +241,26 @@ def control_sphero():
 
                 while not stop_sphero.is_set():
                     with data_lock:
-                        gx = latest_data["gx"]
-                        gy = latest_data["gy"]
-                        gz = latest_data["gz"]
+                        gx             = latest_data["gx"]
+                        gy             = latest_data["gy"]
+                        gz             = latest_data["gz"]
+                        backward_until = latest_data["backward_until"]
+
+                    # ── Double-Tap-Rückwärtsfahrt hat Vorrang vor Gravity-Steuerung ──
+                    if time.time() < backward_until:
+                        try:
+                            backward_heading = (sphero_heading + 180) % 360
+                            sphero.roll(int(backward_heading), BACKWARD_SPEED, 0.1)
+                            sphero.set_main_led(Color(r=160, g=0, b=255))
+                            last_move_time = time.time()
+                            is_stopped     = False
+                        except Exception as e:
+                            if _is_connection_error(e):
+                                connection_lost = True
+                                break
+                            print(f"[WARN] Rückwärts-Befehl fehlgeschlagen: {e}")
+                        time.sleep(0.05)
+                        continue
 
                     state = get_state(gx, gy, gz)
 
