@@ -10,6 +10,11 @@ import threading
 import time
 import math
 import logging
+import csv
+import os
+import json
+import concurrent.futures
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 from collections import deque
@@ -53,6 +58,7 @@ latest_data = {
     "gx": 0.0, "gy": 0.0, "gz": 0.0,
     "state": "neutral", "heading": 0,
     "backward_until": 0.0,
+    "last_update": 0.0,   # time.time() der letzten echten Sensor-POST; 0.0 = noch nie
 }
 
 # Live-Graph-Daten
@@ -75,6 +81,7 @@ MAX_TURN_ANGLE       = 90
 TURN_DEADZONE        = 0.80
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
 BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
+DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine Daten", bleibt stehen
 
 # ── Live-Graph-Konfiguration ─────────────────────────────────────────────────
 HR_WARN    = 100
@@ -130,6 +137,309 @@ def compute_load_index(intensities: list, heart_rates: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sitzungsaufzeichnung – synchronisierte Roh- und Auswertungsdaten je Sitzung
+# ─────────────────────────────────────────────────────────────────────────────
+
+SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions")
+
+_CSV_SCHEMAS = {
+    "sensor":       ["t_rel_s", "timestamp", "gx", "gy", "gz",
+                      "accel_x", "accel_y", "accel_z", "heart_rate", "intensity"],
+    "control":      ["t_rel_s", "timestamp", "gx", "gy", "gz",
+                      "state", "heading_deg", "speed_cmd", "is_stopped"],
+    "tracking":     ["t_rel_s", "timestamp", "person_id", "distance_m",
+                      "angle_left_deg", "angle_right_deg"],
+    "events":       ["t_rel_s", "timestamp", "event", "detail"],
+    "video_frames": ["frame_index", "t_rel_s", "timestamp"],
+}
+
+
+class SessionRecorder:
+    """
+    Zeichnet eine komplette Reha-Sitzung threadsicher und zeitsynchron auf.
+
+    Jede Zeile jeder Teil-Tabelle (Sensor, Steuerung, Tracking, Events) und
+    jeder Videoframe bekommt dieselbe Referenzuhr (t_rel_s = Sekunden seit
+    Sitzungsstart). Dadurch lässt sich in der Postanalyse jeder Messwert
+    exakt einem Videoabschnitt zuordnen, unabhängig von Sensor-Sende- oder
+    Kamera-Framerate-Schwankungen.
+    """
+
+    FLUSH_INTERVAL_S = 0.5   # gebündeltes Flush-Intervall statt Flush pro Zeile
+
+    def __init__(self):
+        self._lock          = threading.RLock()
+        self.active         = False
+        self.session_dir    = None
+        self.start_time     = None
+        self._start_wall    = None
+        self._files         = {}
+        self._writers       = {}
+        self._counts        = {}
+        self._last_flush    = 0.0
+        self._video_writer  = None
+        self._video_frame_count = 0
+        self._subsystems_seen = {"sphero": False, "camera": False}
+
+        # Gepufferte Werte für die automatisch erzeugten Auswertungsdiagramme
+        self._plot = {
+            "t": [], "intensity": [], "heart_rate": [],
+            "angle_t": [], "angle_left": [], "angle_right": [],
+            "dist_t": [], "distance": [],
+        }
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def start(self):
+        with self._lock:
+            if self.active:
+                return None
+            os.makedirs(SESSIONS_DIR, exist_ok=True)
+            session_id = "session_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.session_dir = os.path.join(SESSIONS_DIR, session_id)
+            os.makedirs(os.path.join(self.session_dir, "plots"), exist_ok=True)
+
+            self.start_time  = time.time()
+            self._start_wall = datetime.now().isoformat()
+            self._counts     = {name: 0 for name in _CSV_SCHEMAS}
+            self._last_flush = 0.0
+            self._subsystems_seen = {"sphero": False, "camera": False}
+            self._video_writer = None
+            self._video_frame_count = 0
+            for key in self._plot:
+                self._plot[key] = []
+
+            for name, header in _CSV_SCHEMAS.items():
+                path = os.path.join(self.session_dir, f"{name}.csv")
+                f = open(path, "w", newline="", encoding="utf-8")
+                writer = csv.writer(f)
+                writer.writerow(header)
+                self._files[name]   = f
+                self._writers[name] = writer
+
+            self._write_metadata(final=False)
+            self.active = True
+            self._log_event_locked("session_start", session_id)
+            return self.session_dir
+
+    def stop(self):
+        with self._lock:
+            if not self.active:
+                return None
+            self._log_event_locked("session_end", "")
+            self.active = False
+
+            if self._video_writer is not None:
+                self._video_writer.release()
+                self._video_writer = None
+
+            for f in self._files.values():
+                f.close()
+            self._files.clear()
+            self._writers.clear()
+
+            self._write_metadata(final=True)
+            self._save_plots()
+
+            finished_dir = self.session_dir
+            self.session_dir = None
+            return finished_dir
+
+    # ── Logging-Methoden (threadsicher) ──────────────────────────────────────
+
+    def _now(self):
+        t_rel = time.time() - self.start_time
+        return t_rel, datetime.now().isoformat()
+
+    def _maybe_flush(self):
+        """
+        Puffert Schreibzugriffe und flusht nur alle FLUSH_INTERVAL_S auf die
+        Platte, statt bei jeder einzelnen Zeile. log_sensor()/log_control()
+        laufen im Flask-Request-Thread bzw. im 20-Hz-Sphero-Steuerungs-Thread –
+        ein flush() (Disk-Syscall) bei jedem einzelnen Aufruf hat dort spürbare
+        Latenz verursacht (verzögerte Sensordaten, BLE-Timing-Störungen).
+        """
+        now = time.time()
+        if now - self._last_flush >= self.FLUSH_INTERVAL_S:
+            for f in self._files.values():
+                f.flush()
+            self._last_flush = now
+
+    def log_sensor(self, gx, gy, gz, ax, ay, az, hr, intensity):
+        if not self.active:
+            return
+        with self._lock:
+            if not self.active:
+                return
+            t_rel, ts = self._now()
+            self._writers["sensor"].writerow(
+                [f"{t_rel:.3f}", ts, gx, gy, gz, ax, ay, az, hr, intensity])
+            self._counts["sensor"] += 1
+            self._plot["t"].append(t_rel)
+            self._plot["intensity"].append(intensity)
+            self._plot["heart_rate"].append(hr)
+            self._maybe_flush()
+
+    def log_control(self, gx, gy, gz, state, heading, speed_cmd, is_stopped):
+        if not self.active:
+            return
+        with self._lock:
+            if not self.active:
+                return
+            self._subsystems_seen["sphero"] = True
+            t_rel, ts = self._now()
+            self._writers["control"].writerow(
+                [f"{t_rel:.3f}", ts, gx, gy, gz, state, heading, speed_cmd, is_stopped])
+            self._counts["control"] += 1
+            self._maybe_flush()
+
+    def log_tracking(self, person_id, distance, angle_left, angle_right):
+        if not self.active:
+            return
+        with self._lock:
+            if not self.active:
+                return
+            self._subsystems_seen["camera"] = True
+            t_rel, ts = self._now()
+            self._writers["tracking"].writerow(
+                [f"{t_rel:.3f}", ts, person_id, distance, angle_left, angle_right])
+            self._counts["tracking"] += 1
+            self._maybe_flush()
+            if distance is not None:
+                self._plot["dist_t"].append(t_rel)
+                self._plot["distance"].append(distance)
+            if angle_left is not None or angle_right is not None:
+                self._plot["angle_t"].append(t_rel)
+                self._plot["angle_left"].append(angle_left)
+                self._plot["angle_right"].append(angle_right)
+
+    def log_event(self, event: str, detail: str = ""):
+        if not self.active:
+            return
+        with self._lock:
+            self._log_event_locked(event, detail)
+
+    def _log_event_locked(self, event: str, detail: str):
+        if "events" not in self._writers:
+            return
+        t_rel, ts = self._now()
+        self._writers["events"].writerow([f"{t_rel:.3f}", ts, event, detail])
+        self._files["events"].flush()
+        self._counts["events"] += 1
+
+    def write_video_frame(self, frame, cv2):
+        """Schreibt einen bereits mit Overlays versehenen Frame in die Session-Videodatei."""
+        if not self.active:
+            return
+        with self._lock:
+            if not self.active:
+                return
+            self._subsystems_seen["camera"] = True
+            t_rel, ts = self._now()
+
+            if self._video_writer is None:
+                h, w = frame.shape[:2]
+                path = os.path.join(self.session_dir, "video.mp4")
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self._video_writer = cv2.VideoWriter(path, fourcc, 30.0, (w, h))
+
+            self._video_writer.write(frame)
+            self._writers["video_frames"].writerow(
+                [self._video_frame_count, f"{t_rel:.3f}", ts])
+            self._video_frame_count += 1
+            self._counts["video_frames"] += 1
+            self._maybe_flush()
+
+    # ── Abschluss: Metadaten + Diagramme ─────────────────────────────────────
+
+    def _write_metadata(self, final: bool):
+        meta = {
+            "session_id": os.path.basename(self.session_dir),
+            "start_time_iso": self._start_wall,
+            "end_time_iso": datetime.now().isoformat() if final else None,
+            "duration_s": round(time.time() - self.start_time, 2) if final else None,
+            "subsystems_active": self._subsystems_seen,
+            "row_counts": dict(self._counts),
+            "config": {
+                "MIN_SPEED_DYN": MIN_SPEED_DYN, "MAX_SPEED_DYN": MAX_SPEED_DYN,
+                "TURN_SPEED_FACTOR": TURN_SPEED_FACTOR, "STOP_TIME": STOP_TIME,
+                "GY_RIGHT_THRESHOLD": GY_RIGHT_THRESHOLD, "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
+                "GX_FORWARD_MAX": GX_FORWARD_MAX, "GX_NEUTRAL_THRESHOLD": GX_NEUTRAL_THRESHOLD,
+                "MAX_TURN_ANGLE": MAX_TURN_ANGLE, "TURN_DEADZONE": TURN_DEADZONE,
+                "BACKWARD_DURATION": BACKWARD_DURATION, "BACKWARD_SPEED": BACKWARD_SPEED,
+                "HR_WARN": HR_WARN, "HR_DANGER": HR_DANGER,
+            },
+            "files": {
+                "sensor_log": "sensor.csv", "control_log": "control.csv",
+                "tracking_log": "tracking.csv", "events_log": "events.csv",
+                "video": "video.mp4" if self._subsystems_seen["camera"] else None,
+                "video_frame_index": "video_frames.csv",
+                "plots_dir": "plots/",
+            },
+        }
+        with open(os.path.join(self.session_dir, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    def _save_plots(self):
+        plots_dir = os.path.join(self.session_dir, "plots")
+
+        if len(self._plot["t"]) >= 2:
+            t   = self._plot["t"]
+            raw = self._plot["intensity"]
+            hr  = self._plot["heart_rate"]
+            smoothed = moving_average(raw, SMOOTH_WIN)
+            load     = compute_load_index(raw, hr)
+
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+            fig.suptitle("Sitzungs-Übersicht", fontsize=13, fontweight="bold")
+
+            ax1.plot(t, raw, color="lightsteelblue", alpha=0.5, linewidth=0.8, label="Roh")
+            ax1.plot(t, smoothed, color="steelblue", linewidth=1.8, label=f"Geglättet (n={SMOOTH_WIN})")
+            ax1.set_title("Bewegungsintensität"); ax1.set_ylabel("Intensität")
+            ax1.legend(loc="upper left", fontsize=8); ax1.grid(True, alpha=0.4)
+
+            ax2.plot(t, hr, color="steelblue", linewidth=1.8)
+            ax2.axhline(HR_WARN, color="orange", linestyle="--", linewidth=1.2, label=f"Warnung {HR_WARN} BPM")
+            ax2.axhline(HR_DANGER, color="red", linestyle="--", linewidth=1.2, label=f"Gefahr {HR_DANGER} BPM")
+            ax2.set_title("Herzfrequenz"); ax2.set_ylabel("BPM")
+            ax2.legend(loc="upper left", fontsize=8); ax2.grid(True, alpha=0.4)
+
+            if load:
+                ax3.plot(t, load, color="steelblue", linewidth=1.8)
+                ax3.fill_between(t, load, alpha=0.2, color="steelblue")
+                ax3.set_ylim(0, 105)
+            ax3.set_title("Belastungsindex (kombiniert)")
+            ax3.set_xlabel("Zeit (s)"); ax3.set_ylabel("Index (0–100)")
+            ax3.grid(True, alpha=0.4)
+
+            fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "uebersicht.png"), dpi=150)
+            plt.close(fig)
+
+        if self._plot["angle_t"]:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(self._plot["angle_t"], self._plot["angle_left"], label="Links", color="tab:blue")
+            ax.plot(self._plot["angle_t"], self._plot["angle_right"], label="Rechts", color="tab:orange")
+            ax.set_title("Armstreckungswinkel"); ax.set_xlabel("Zeit (s)"); ax.set_ylabel("Grad")
+            ax.legend(loc="upper left", fontsize=8); ax.grid(True, alpha=0.4)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "winkel.png"), dpi=150)
+            plt.close(fig)
+
+        if self._plot["dist_t"]:
+            fig, ax = plt.subplots(figsize=(10, 3))
+            ax.plot(self._plot["dist_t"], self._plot["distance"], color="tab:green")
+            ax.set_title("Kameraabstand"); ax.set_xlabel("Zeit (s)"); ax.set_ylabel("m")
+            ax.grid(True, alpha=0.4)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "abstand.png"), dpi=150)
+            plt.close(fig)
+
+
+recorder = SessionRecorder()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Flask Route (empfängt alle Sensordaten)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -141,9 +451,16 @@ def sensorlog():
     
     # ── NEU: Double Tap ist ein reiner Event-POST ohne Sensordaten ──
     if data.get("doubleTap"):
+        now = time.time()
         with data_lock:
-            latest_data["backward_until"] = time.time() + BACKWARD_DURATION
-        print("[EVENT] Double Tap → Rückwärts")
+            # Watch feuert die Geste manchmal mehrfach kurz hintereinander;
+            # solange das Rückwärtsfenster noch läuft, nur verlängern statt
+            # jedes Mal neu zu loggen/zu drucken.
+            is_new_trigger = now >= latest_data["backward_until"]
+            latest_data["backward_until"] = now + BACKWARD_DURATION
+        if is_new_trigger:
+            recorder.log_event("double_tap", "Rückwärtsfahrt ausgelöst")
+            print("[EVENT] Double Tap → Rückwärts")
         return "OK", 200          # ← wichtig: hier beenden!
 
     # Sphero-Steuerung (Schwerkraft)
@@ -161,10 +478,11 @@ def sensorlog():
     current_time = time.time() - graph_start_time
 
     with data_lock:
-        latest_data["gx"]    = gx
-        latest_data["gy"]    = gy
-        latest_data["gz"]    = gz
-        latest_data["state"] = state
+        latest_data["gx"]          = gx
+        latest_data["gy"]          = gy
+        latest_data["gz"]          = gz
+        latest_data["state"]       = state
+        latest_data["last_update"] = time.time()
         intensity_values.append(intensity)
         heart_rate_values.append(hr)
         graph_time_values.append(current_time)
@@ -173,7 +491,7 @@ def sensorlog():
 
 
 def run_server():
-    flask_app.run(host='0.0.0.0', port=56671, debug=False, use_reloader=False)
+    flask_app.run(host='0.0.0.0', port=56671, debug=False, use_reloader=False, threaded=True)
 
 
 def start_server_once():
@@ -190,11 +508,122 @@ def start_server_once():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_connection_error(exc: Exception) -> bool:
-    """Erkennt BleakError 'Not connected' und concurrent.futures.TimeoutError."""
-    if isinstance(exc, TimeoutError):
+    """
+    Erkennt BLE-Verbindungsabbrüche.
+
+    Wichtig: Unter Python 3.8 ist concurrent.futures.TimeoutError NICHT
+    dasselbe wie das eingebaute TimeoutError (erst ab 3.11 ein Alias!) und
+    sein str() ist leer (''). Ein reiner isinstance(exc, TimeoutError)- oder
+    "timeout" in msg-Check lässt diese Exception (und viele BLE-OSErrors mit
+    Windows-Fehlercodes) unerkannt durchrutschen – die Steuerung erkennt den
+    Verbindungsverlust dann nie und hämmert weiter erfolglos auf die tote
+    Verbindung ein, was die ganze App einfrieren lässt.
+    """
+    if isinstance(exc, (OSError, concurrent.futures.TimeoutError)):
+        return True
+    # Alle bleak-Exceptions (BleakError, BleakDeviceNotFoundError, ...) sind
+    # in diesem Kontext Verbindungsfehler – auch wenn ihr str() weder
+    # "bleakerror" noch "not connected" enthält (z.B. "... was not found").
+    if type(exc).__module__.startswith("bleak"):
         return True
     msg = str(exc).lower()
     return "not connected" in msg or "bleakerror" in msg or "timeout" in msg
+
+
+SPHERO_CMD_TIMEOUT = 1.5   # Sekunden – eigene Obergrenze pro Sphero-Befehl
+
+
+class _SpheroCommandGuard:
+    """
+    Führt Sphero-Befehle mit selbst gesetztem, kurzem Timeout aus und stellt
+    sicher, dass nie zwei Befehle gleichzeitig in die spherov2-API laufen.
+
+    Timeout: spherov2 wartet intern bis zu 10s auf eine BLE-Antwort
+    (Toy._wait_packet, hartkodiert timeout=10.0) – und SpheroEduAPI.roll()
+    ruft dafür sogar zweimal hintereinander in die Bibliothek hinein (Speed
+    setzen + automatisches stop_roll). Bei totem Link würde ein einzelner
+    Befehl unseren Steuerungs-Thread sonst bis zu ~20 Sekunden einfrieren.
+    Der eigentliche Aufruf läuft deshalb in einem Daemon-Thread; wir warten
+    nur `timeout` Sekunden darauf.
+
+    Serialisierung: Läuft ein Befehl über sein Timeout hinaus weiter
+    (verwaister Thread), darf der nächste nicht parallel in die nicht
+    threadsichere API greifen. Neue Aufrufe warten deshalb höchstens
+    `timeout` auf das Ende des vorigen Befehls und schlagen sonst
+    kontrolliert fehl. Pro (Re-)Verbindung wird eine frische Instanz
+    erzeugt, damit ein hängender Befehl einer alten, toten Verbindung die
+    neue nicht blockiert.
+    """
+
+    def __init__(self):
+        self._busy = threading.Lock()
+
+    def call(self, func, *args, timeout=SPHERO_CMD_TIMEOUT, **kwargs):
+        if not self._busy.acquire(timeout=timeout):
+            raise concurrent.futures.TimeoutError(
+                f"Voriger Sphero-Befehl hängt noch – {getattr(func, '__name__', func)} übersprungen"
+            )
+        result = {}
+
+        def _run():
+            try:
+                result["value"] = func(*args, **kwargs)
+            except Exception as e:
+                result["error"] = e
+            finally:
+                self._busy.release()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            raise concurrent.futures.TimeoutError(
+                f"Sphero-Befehl {getattr(func, '__name__', func)} antwortet nicht innerhalb {timeout}s"
+            )
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+
+class _SpheroAPIFastClose(SpheroEduAPI):
+    """
+    SpheroEduAPI, deren __exit__ bei toter Verbindung nicht lange blockiert.
+
+    Das Original-__exit__ sendet beim Verlassen des with-Blocks noch Befehle
+    an den Sphero (ToyUtil.sleep) und joint seinen Hintergrund-Thread; auf
+    einer bereits abgerissenen Verbindung wartet jeder dieser Schritte bis
+    zu 10s auf eine Antwort, die nie kommt. Genau das hat nach einem
+    Verbindungsverlust den Reconnect um viele Sekunden verzögert – die App
+    wirkte "eingefroren". Der Abbau läuft deshalb in einem Daemon-Thread
+    mit kurzer Wartezeit: hängt er, wird er aufgegeben und läuft im
+    Hintergrund zu Ende; beim nächsten Verbindungsaufbau wird ohnehin neu
+    gescannt und frisch aufgebaut.
+    """
+
+    # Wird von der Steuerung auf True gesetzt, wenn der Abriss erkannt wurde.
+    connection_dead = False
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        def _teardown():
+            if self.connection_dead:
+                # Tote Verbindung sofort hart auf OS-Ebene kappen. Erst wenn
+                # Windows die Verbindung wirklich freigibt, merkt der Sphero
+                # den Abriss und beginnt wieder zu advertisen – und nur einen
+                # advertisenden Sphero kann der Reconnect-Scan überhaupt
+                # finden. Ohne diesen Schritt hinge die alte Verbindung noch
+                # ~10s in den Timeouts des Original-__exit__ fest.
+                try:
+                    self._SpheroEduAPI__toy._Toy__adapter.close()
+                except Exception:
+                    pass
+            try:
+                SpheroEduAPI.__exit__(self, exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_teardown, daemon=True)
+        t.start()
+        t.join(4.0)
 
 
 def control_sphero():
@@ -204,6 +633,14 @@ def control_sphero():
     RECONNECT_DELAY  = 3.0   # Sekunden zwischen Reconnect-Versuchen
     reconnect_count  = 0
     sphero_heading   = 0     # Heading über Reconnects hinweg behalten
+
+    # Ein einzelner fehlgeschlagener Befehl bedeutet nicht zwangsläufig einen
+    # echten Verbindungsabbruch – z.B. kann ein Zusammenstoß (Wand, Hindernis)
+    # die Sphero-Firmware kurz blockieren, sodass ein einzelner Befehl einen
+    # Timeout wirft, obwohl die BLE-Verbindung Sekundenbruchteile später
+    # wieder normal reagiert. Erst nach mehreren Fehlversuchen in Folge gilt
+    # die Verbindung als wirklich verloren (→ voller Reconnect-Zyklus).
+    MAX_CONSECUTIVE_FAILURES = 3
 
     while not stop_sphero.is_set() and reconnect_count <= MAX_RECONNECTS:
 
@@ -215,28 +652,72 @@ def control_sphero():
 
         try:
             toy = scanner.find_toy()
-            if not toy:
-                set_status("Kein Sphero gefunden. Bluetooth und Sphero prüfen.")
-                return
+            scan_error = None
         except Exception as e:
-            set_status(f"Sphero-Start fehlgeschlagen: {e}")
-            return
+            toy        = None
+            scan_error = e
+
+        if not toy:
+            if reconnect_count == 0:
+                # Erststart: Sphero ist vermutlich aus oder Bluetooth fehlt –
+                # klare Meldung und Ende.
+                if scan_error is not None:
+                    set_status(f"Sphero-Start fehlgeschlagen: {scan_error}")
+                else:
+                    set_status("Kein Sphero gefunden. Bluetooth und Sphero prüfen.")
+                return
+            # Reconnect-Fall: Direkt nach einem Abriss advertist der Sphero
+            # oft noch nicht wieder (die alte Verbindung muss OS- und
+            # firmwareseitig erst freigegeben werden). Ein leerer Scan ist
+            # hier also zu ERWARTEN – als Fehlversuch zählen und erneut
+            # scannen, statt wie früher die Steuerung komplett zu beenden.
+            reconnect_count += 1
+            recorder.log_event("sphero_rescan_failed",
+                               f"Versuch {reconnect_count}/{MAX_RECONNECTS}")
+            if reconnect_count > MAX_RECONNECTS:
+                set_status(
+                    f"Sphero nach {MAX_RECONNECTS} Scan-Versuchen nicht wiedergefunden. "
+                    "Sphero bitte aus- und wieder einschalten, dann neu starten."
+                )
+                recorder.log_event("sphero_reconnect_gave_up", "")
+                return
+            set_status(
+                f"Sphero noch nicht wieder sichtbar – neuer Scan in "
+                f"{int(RECONNECT_DELAY)}s ({reconnect_count}/{MAX_RECONNECTS})..."
+            )
+            time.sleep(RECONNECT_DELAY)
+            continue
 
         # ── Steuerungs-Loop ───────────────────────────────────────────────────
         connection_lost = False
         try:
-            with SpheroEduAPI(toy) as sphero:
-                sphero_api     = sphero
-                last_move_time = time.time()
-                is_stopped     = True
+            with _SpheroAPIFastClose(toy) as sphero:
+                sphero_api           = sphero
+                last_move_time       = time.time()
+                is_stopped           = True
+                consecutive_failures = 0
+                was_backward         = False
+                guard                = _SpheroCommandGuard()
+                current_led          = None
 
-                sphero.set_heading(sphero_heading)
-                sphero.set_main_led(Color(r=255, g=255, b=255))
+                def set_led(r, g, b):
+                    # LED nur bei Farbwechsel senden – vorher wurde dieselbe
+                    # Farbe bei jedem Schleifendurchlauf erneut gefunkt und
+                    # hat den BLE-Verkehr unnötig aufgebläht.
+                    nonlocal current_led
+                    if current_led != (r, g, b):
+                        guard.call(sphero.set_main_led, Color(r=r, g=g, b=b))
+                        current_led = (r, g, b)
+
+                guard.call(sphero.set_heading, sphero_heading)
+                set_led(255, 255, 255)
 
                 if reconnect_count == 0:
                     set_status("Sphero verbunden. Sensor-App kann Daten senden.")
+                    recorder.log_event("sphero_connected", "")
                 else:
                     set_status(f"Sphero wieder verbunden (Versuch {reconnect_count}).")
+                    recorder.log_event("sphero_reconnected", f"Versuch {reconnect_count}")
                 reconnect_count = 0  # bei Erfolg zurücksetzen
 
                 while not stop_sphero.is_set():
@@ -245,32 +726,57 @@ def control_sphero():
                         gy             = latest_data["gy"]
                         gz             = latest_data["gz"]
                         backward_until = latest_data["backward_until"]
+                        last_update    = latest_data["last_update"]
 
                     # ── Double-Tap-Rückwärtsfahrt hat Vorrang vor Gravity-Steuerung ──
                     if time.time() < backward_until:
                         try:
+                            if not was_backward:
+                                # Sanfter Übergang: erst stoppen und kurz
+                                # ausrollen lassen. Eine abrupte Richtungs-
+                                # umkehr unter Fahrt erzeugt eine Stromspitze
+                                # in den Motoren, die (v.a. bei schwächerem
+                                # Akku) die Versorgungsspannung einbrechen
+                                # und die BLE-Verbindung abreißen lassen kann.
+                                guard.call(sphero.stop_roll, int(sphero_heading))
+                                set_led(160, 0, 255)
+                                time.sleep(0.3)
+                                was_backward = True
                             backward_heading = (sphero_heading + 180) % 360
-                            sphero.roll(int(backward_heading), BACKWARD_SPEED, 0.1)
-                            sphero.set_main_led(Color(r=160, g=0, b=255))
+                            guard.call(sphero.roll, int(backward_heading), BACKWARD_SPEED, 0.1)
+                            set_led(160, 0, 255)
                             last_move_time = time.time()
                             is_stopped     = False
+                            consecutive_failures = 0
                         except Exception as e:
                             if _is_connection_error(e):
-                                connection_lost = True
-                                break
-                            print(f"[WARN] Rückwärts-Befehl fehlgeschlagen: {e}")
+                                consecutive_failures += 1
+                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                                    connection_lost = True
+                                    break
+                                print(f"[WARN] Rückwärts-Befehl fehlgeschlagen ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
+                            else:
+                                print(f"[WARN] Rückwärts-Befehl fehlgeschlagen: {e}")
+                        recorder.log_control(gx, gy, gz, "backward", sphero_heading, BACKWARD_SPEED, False)
                         time.sleep(0.05)
                         continue
 
-                    state = get_state(gx, gy, gz)
+                    was_backward = False
+
+                    # ── Ohne frische Sensordaten von Handy/Watch nichts fahren ──────
+                    # (gx/gy/gz stehen sonst auf ihrem 0.0-Default, was get_state()
+                    #  fälschlich als "forward" auswertet)
+                    data_is_stale = (last_update == 0.0) or (time.time() - last_update > DATA_TIMEOUT)
+                    state         = "neutral" if data_is_stale else get_state(gx, gy, gz)
+                    applied_speed = 0
 
                     try:
                         if state == "right":
                             turn           = calc_turn(gy)
-                            speed          = int(calc_speed(gx) * TURN_SPEED_FACTOR)
+                            applied_speed  = int(calc_speed(gx) * TURN_SPEED_FACTOR)
                             sphero_heading = (sphero_heading + turn) % 360
-                            sphero.roll(int(sphero_heading), speed, 0.1)
-                            sphero.set_main_led(Color(r=255, g=100, b=0))
+                            guard.call(sphero.roll, int(sphero_heading), applied_speed, 0.1)
+                            set_led(255, 100, 0)
                             last_move_time = time.time()
                             is_stopped     = False
                             with data_lock:
@@ -278,42 +784,54 @@ def control_sphero():
 
                         elif state == "left":
                             turn           = calc_turn(gy)
-                            speed          = int(calc_speed(gx) * TURN_SPEED_FACTOR)
+                            applied_speed  = int(calc_speed(gx) * TURN_SPEED_FACTOR)
                             sphero_heading = (sphero_heading - turn) % 360
-                            sphero.roll(int(sphero_heading), speed, 0.1)
-                            sphero.set_main_led(Color(r=0, g=200, b=255))
+                            guard.call(sphero.roll, int(sphero_heading), applied_speed, 0.1)
+                            set_led(0, 200, 255)
                             last_move_time = time.time()
                             is_stopped     = False
                             with data_lock:
                                 latest_data["heading"] = sphero_heading
 
                         elif state == "forward":
-                            speed = calc_speed(gx)
-                            sphero.roll(int(sphero_heading), speed, 0.1)
-                            sphero.set_main_led(Color(r=0, g=255, b=0))
+                            applied_speed = calc_speed(gx)
+                            guard.call(sphero.roll, int(sphero_heading), applied_speed, 0.1)
+                            set_led(0, 255, 0)
                             last_move_time = time.time()
                             is_stopped     = False
 
                         elif state == "neutral":
                             if not is_stopped and time.time() - last_move_time > STOP_TIME:
-                                sphero.stop_roll(int(sphero_heading))
-                                sphero.set_main_led(Color(r=255, g=0, b=0))
+                                guard.call(sphero.stop_roll, int(sphero_heading))
                                 is_stopped = True
+                                set_led(255, 0, 0)
+
+                        consecutive_failures = 0
 
                     except Exception as e:
                         if _is_connection_error(e):
-                            connection_lost = True
-                            break
-                        # Andere Fehler: loggen, aber weiterlaufen
-                        print(f"[WARN] Sphero-Befehl fehlgeschlagen: {e}")
+                            consecutive_failures += 1
+                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                                connection_lost = True
+                                break
+                            print(f"[WARN] Sphero-Befehl fehlgeschlagen ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
+                        else:
+                            # Andere Fehler: loggen, aber weiterlaufen
+                            print(f"[WARN] Sphero-Befehl fehlgeschlagen: {e}")
 
+                    recorder.log_control(gx, gy, gz, state, sphero_heading, applied_speed, is_stopped)
                     time.sleep(0.05)
 
                 # Sauber beenden wenn gewollt gestoppt
-                if not connection_lost:
+                if connection_lost:
+                    # __exit__ soll die tote Verbindung sofort hart kappen,
+                    # damit der Sphero schnell wieder advertist und der
+                    # Reconnect-Scan ihn finden kann.
+                    sphero.connection_dead = True
+                else:
                     try:
-                        sphero.stop_roll(0)
-                        sphero.set_main_led(Color(r=0, g=0, b=0))
+                        guard.call(sphero.stop_roll, 0)
+                        set_led(0, 0, 0)
                         time.sleep(0.5)
                     except Exception:
                         pass
@@ -328,6 +846,7 @@ def control_sphero():
         # ── Verbindungsverlust behandeln ──────────────────────────────────────
         if connection_lost and not stop_sphero.is_set():
             reconnect_count += 1
+            recorder.log_event("sphero_connection_lost", f"Reconnect {reconnect_count}/{MAX_RECONNECTS}")
             if reconnect_count <= MAX_RECONNECTS:
                 set_status(
                     f"Verbindung verloren! Reconnect in {int(RECONNECT_DELAY)}s "
@@ -339,9 +858,11 @@ def control_sphero():
                     f"Verbindung nach {MAX_RECONNECTS} Versuchen verloren. "
                     "Sphero bitte neu starten und erneut verbinden."
                 )
+                recorder.log_event("sphero_connection_failed", "")
                 return
 
     set_status("Sphero getrennt.")
+    recorder.log_event("sphero_control_stopped", "")
 
 
 def start_sphero_control() -> bool:
@@ -532,7 +1053,7 @@ def _draw_winkel(frame, kps_2d, kps_3d, schulter_idx, ellbogen_idx, handgelenk_i
     e2d  = kps_2d[ellbogen_idx]
     ex, ey = int(e2d[0]), int(e2d[1])
     if not (0 < ex < w and 0 < ey < h):
-        return
+        return None
     winkel = _berechne_winkel_3d(
         kps_3d[schulter_idx], kps_3d[ellbogen_idx], kps_3d[handgelenk_idx]
     )
@@ -540,7 +1061,7 @@ def _draw_winkel(frame, kps_2d, kps_3d, schulter_idx, ellbogen_idx, handgelenk_i
         cv2.putText(frame, f"{seite}: Nicht sichtbar",
                     (20, 80 if seite == "Links" else 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
-        return
+        return None
     farbe = _winkel_farbe(winkel)
     cv2.circle(frame, (ex, ey), 14, farbe, -1)
     cv2.circle(frame, (ex, ey), 14, (255, 255, 255), 2)
@@ -549,13 +1070,14 @@ def _draw_winkel(frame, kps_2d, kps_3d, schulter_idx, ellbogen_idx, handgelenk_i
     cv2.putText(frame, f"{seite}: {winkel} Grad _ {_winkel_text(winkel)}",
                 (20, 80 if seite == "Links" else 120),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, farbe, 2)
+    return winkel
 
 
 def _draw_abstand(frame, kps_3d, cv2):
     global _last_distance_condition
     p = kps_3d[2]
     if p[2] <= 0:
-        return
+        return None
     abstand = p[2]
     if abstand < 1.0:
         neue_bedingung = "zu_nah"
@@ -578,6 +1100,7 @@ def _draw_abstand(frame, kps_3d, cv2):
     _last_distance_condition = neue_bedingung
     cv2.putText(frame, f"Abstand: {abstand:.2f}m _ {hinweis}",
                 (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, farbe, 2)
+    return abstand
 
 
 def run_camera():
@@ -625,6 +1148,7 @@ def run_camera():
     runtime = sl.RuntimeParameters()
 
     set_status("Kamera läuft. [q] im Kamerafenster zum Stoppen.")
+    recorder.log_event("camera_start", "")
 
     while not stop_camera.is_set():
         if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
@@ -643,14 +1167,16 @@ def run_camera():
                     kps_3d = body.keypoint
 
                     _draw_skeleton(frame, kps_2d, cv2)
-                    _draw_abstand(frame, kps_3d, cv2)
+                    distance = _draw_abstand(frame, kps_3d, cv2)
 
-                    _draw_winkel(frame, kps_2d, kps_3d,
+                    angle_left  = _draw_winkel(frame, kps_2d, kps_3d,
                                  schulter_idx=12, ellbogen_idx=13,
                                  handgelenk_idx=15, seite="Links", cv2=cv2)
-                    _draw_winkel(frame, kps_2d, kps_3d,
+                    angle_right = _draw_winkel(frame, kps_2d, kps_3d,
                                  schulter_idx=5, ellbogen_idx=6,
                                  handgelenk_idx=8, seite="Rechts", cv2=cv2)
+
+                    recorder.log_tracking(body.id, distance, angle_left, angle_right)
 
                     head = kps_2d[27]
                     hx, hy = int(head[0]), int(head[1])
@@ -661,6 +1187,12 @@ def run_camera():
 
             cv2.putText(frame, f"Personen: {person_count}",
                         (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        if recorder.active:
+            elapsed = time.time() - recorder.start_time
+            cv2.putText(frame, f"REC {elapsed:6.1f}s", (20, frame.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            recorder.write_video_frame(frame, cv2)
 
         cv2.putText(frame, "q = Stopp", (frame.shape[1] - 120, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
@@ -675,6 +1207,7 @@ def run_camera():
     zed.close()
     cv2.destroyAllWindows()
     set_status("Kamera gestoppt.")
+    recorder.log_event("camera_stop", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -794,8 +1327,8 @@ class LiveGraphWindow:
 def show_controller_ui():
     root = tk.Tk()
     root.title("Sphero Reha-Controller")
-    root.geometry("480x380")
-    root.minsize(420, 320)
+    root.geometry("480x430")
+    root.minsize(420, 360)
     root.resizable(True, True)
 
     status_var  = tk.StringVar(value=last_status)
@@ -823,13 +1356,19 @@ def show_controller_ui():
     stop_button   = ttk.Button(buttons, text="■  Sphero stoppen")
     graph_button  = ttk.Button(buttons, text="📊  Live Graphen")
     camera_button = ttk.Button(buttons, text="📷  Kamera starten")
+    record_button = ttk.Button(buttons, text="⏺  Aufzeichnung starten")
 
     start_button.grid( row=0, column=0, sticky="ew", padx=(0, 6), pady=3)
     stop_button.grid(  row=0, column=1, sticky="ew",              pady=3)
     graph_button.grid( row=1, column=0, sticky="ew", padx=(0, 6), pady=3)
     camera_button.grid(row=1, column=1, sticky="ew",              pady=3)
+    record_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
     buttons.columnconfigure(0, weight=1)
     buttons.columnconfigure(1, weight=1)
+
+    recording_var = tk.StringVar(value="Keine Aufzeichnung aktiv")
+    ttk.Label(main, textvariable=recording_var,
+              font=("Consolas", 9), foreground="#aa0000").pack(anchor="w", pady=(4, 0))
 
     ttk.Separator(main).pack(fill="x", pady=12)
 
@@ -890,6 +1429,22 @@ def show_controller_ui():
             text="⏹  Kamera stoppen" if cam_running else "📷  Kamera starten"
         )
 
+        gw = graph_window_ref[0]
+        graph_open = gw is not None and gw.win.winfo_exists()
+        graph_button.config(
+            text="⏹  Graphen schließen" if graph_open else "📊  Live Graphen"
+        )
+
+        if recorder.active:
+            elapsed = time.time() - recorder.start_time
+            record_button.config(text="⏹  Aufzeichnung stoppen")
+            recording_var.set(
+                f"● Aufzeichnung läuft – {elapsed:0.0f}s  ({os.path.basename(recorder.session_dir)})"
+            )
+        else:
+            record_button.config(text="⏺  Aufzeichnung starten")
+            recording_var.set("Keine Aufzeichnung aktiv")
+
         root.after(200, refresh_ui)
 
     # ── Button-Handler ─────────────────────────────────────────────────────────
@@ -900,13 +1455,13 @@ def show_controller_ui():
     def stop_clicked():
         stop_sphero_control()
 
-    def open_graphs():
-        start_server_once()
+    def toggle_graphs():
         gw = graph_window_ref[0]
-        if gw is None or not gw.win.winfo_exists():
-            graph_window_ref[0] = LiveGraphWindow(root)
+        if gw is not None and gw.win.winfo_exists():
+            gw.close()
         else:
-            gw.win.lift()
+            start_server_once()
+            graph_window_ref[0] = LiveGraphWindow(root)
 
     def toggle_camera():
         cam = camera_thread_ref[0]
@@ -921,17 +1476,35 @@ def show_controller_ui():
             camera_thread_ref[0] = t
             set_status("Kamera startet (ZED2i)...")
 
+    def toggle_recording():
+        if recorder.active:
+            session_dir = recorder.stop()
+            if session_dir:
+                messagebox.showinfo(
+                    "Aufzeichnung gespeichert",
+                    f"Sitzung wurde gespeichert unter:\n{session_dir}"
+                )
+        else:
+            start_server_once()
+            recorder.start()
+
     def on_close():
         stop_sphero_control()
         stop_camera.set()
+        gw = graph_window_ref[0]
+        if gw is not None and gw.win.winfo_exists():
+            gw.close()
+        if recorder.active:
+            recorder.stop()
         root.destroy()
 
 
     # ── Callbacks zuweisen ────────────────────────────────────────────────────
     start_button.config( command=start_clicked)
     stop_button.config(  command=stop_clicked,  state="disabled")
-    graph_button.config( command=open_graphs)
+    graph_button.config( command=toggle_graphs)
     camera_button.config(command=toggle_camera)
+    record_button.config(command=toggle_recording)
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     refresh_ui()
