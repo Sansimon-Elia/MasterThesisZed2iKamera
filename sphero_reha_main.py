@@ -31,6 +31,9 @@ from spherov2 import scanner
 from spherov2.sphero_edu import SpheroEduAPI
 from spherov2.types import Color
 
+# Probandenverwaltung (pseudonymisierte Stammdaten + Eingabemaske)
+import probanden
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
@@ -173,6 +176,9 @@ class SessionRecorder:
         self.session_dir    = None
         self.start_time     = None
         self._start_wall    = None
+        self.participant_id = None
+        self.video_consent  = False
+        self._participant   = None
         self._files         = {}
         self._writers       = {}
         self._counts        = {}
@@ -190,13 +196,32 @@ class SessionRecorder:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
-    def start(self):
+    def start(self, participant: dict, video_consent: bool):
+        """
+        Startet eine Aufzeichnung für eine konkrete, bereits angelegte Testperson.
+
+        `participant` ist der pseudonymisierte Stammdatensatz (ohne Klarnamen);
+        ohne ihn wird nicht aufgezeichnet. `video_consent` entscheidet, ob
+        überhaupt eine Videodatei entsteht – die Videoaufzeichnung ist
+        freiwillig und kann pro Sitzung einzeln widerrufen werden.
+        """
         with self._lock:
             if self.active:
                 return None
-            os.makedirs(SESSIONS_DIR, exist_ok=True)
-            session_id = "session_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self.session_dir = os.path.join(SESSIONS_DIR, session_id)
+            if not participant or not participant.get("participant_id"):
+                raise ValueError("Aufzeichnung ohne ausgewählte Testperson nicht möglich.")
+
+            self.participant_id = participant["participant_id"]
+            self.video_consent  = bool(video_consent)
+            self._participant   = probanden.analysis_view(participant)
+
+            # Sitzungen liegen unter sessions/<Teilnehmer-ID>/, damit in der
+            # Auswertung alle Aufnahmen einer Person beisammen liegen.
+            participant_dir = os.path.join(SESSIONS_DIR, self.participant_id)
+            os.makedirs(participant_dir, exist_ok=True)
+            session_id = (f"{self.participant_id}_session_"
+                          + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+            self.session_dir = os.path.join(participant_dir, session_id)
             os.makedirs(os.path.join(self.session_dir, "plots"), exist_ok=True)
 
             self.start_time  = time.time()
@@ -210,6 +235,9 @@ class SessionRecorder:
                 self._plot[key] = []
 
             for name, header in _CSV_SCHEMAS.items():
+                # Ohne Video-Einwilligung entsteht auch kein Frame-Index.
+                if name == "video_frames" and not self.video_consent:
+                    continue
                 path = os.path.join(self.session_dir, f"{name}.csv")
                 f = open(path, "w", newline="", encoding="utf-8")
                 writer = csv.writer(f)
@@ -220,6 +248,9 @@ class SessionRecorder:
             self._write_metadata(final=False)
             self.active = True
             self._log_event_locked("session_start", session_id)
+            self._log_event_locked("participant", self.participant_id)
+            self._log_event_locked(
+                "video_consent", "erteilt" if self.video_consent else "nicht erteilt")
             return self.session_dir
 
     def stop(self):
@@ -328,11 +359,17 @@ class SessionRecorder:
         self._counts["events"] += 1
 
     def write_video_frame(self, frame, cv2):
-        """Schreibt einen bereits mit Overlays versehenen Frame in die Session-Videodatei."""
-        if not self.active:
+        """
+        Schreibt einen bereits mit Overlays versehenen Frame in die Session-Videodatei.
+
+        Ohne erteilte Video-Einwilligung wird der Frame verworfen: Das
+        Kamerabild bleibt zur Live-Rückmeldung auf dem Bildschirm, es entsteht
+        aber keinerlei Videodatei auf der Platte.
+        """
+        if not self.active or not self.video_consent:
             return
         with self._lock:
-            if not self.active:
+            if not self.active or not self.video_consent:
                 return
             self._subsystems_seen["camera"] = True
             t_rel, ts = self._now()
@@ -353,8 +390,12 @@ class SessionRecorder:
     # ── Abschluss: Metadaten + Diagramme ─────────────────────────────────────
 
     def _write_metadata(self, final: bool):
+        video_recorded = self.video_consent and self._subsystems_seen["camera"]
         meta = {
             "session_id": os.path.basename(self.session_dir),
+            "participant_id": self.participant_id,
+            "participant": self._participant,
+            "video_consent": self.video_consent,
             "start_time_iso": self._start_wall,
             "end_time_iso": datetime.now().isoformat() if final else None,
             "duration_s": round(time.time() - self.start_time, 2) if final else None,
@@ -372,8 +413,8 @@ class SessionRecorder:
             "files": {
                 "sensor_log": "sensor.csv", "control_log": "control.csv",
                 "tracking_log": "tracking.csv", "events_log": "events.csv",
-                "video": "video.mp4" if self._subsystems_seen["camera"] else None,
-                "video_frame_index": "video_frames.csv",
+                "video": "video.mp4" if video_recorded else None,
+                "video_frame_index": "video_frames.csv" if self.video_consent else None,
                 "plots_dir": "plots/",
             },
         }
@@ -1327,8 +1368,8 @@ class LiveGraphWindow:
 def show_controller_ui():
     root = tk.Tk()
     root.title("Sphero Reha-Controller")
-    root.geometry("480x430")
-    root.minsize(420, 360)
+    root.geometry("520x570")
+    root.minsize(460, 520)
     root.resizable(True, True)
 
     status_var  = tk.StringVar(value=last_status)
@@ -1339,6 +1380,19 @@ def show_controller_ui():
     graph_window_ref = [None]
     camera_thread_ref = [None]
 
+    # ── Probandenverwaltung ───────────────────────────────────────────────────
+    try:
+        registry = probanden.ParticipantRegistry(SESSIONS_DIR)
+    except RuntimeError as e:
+        messagebox.showerror("Probandendaten nicht lesbar", str(e))
+        root.destroy()
+        return
+
+    selected_pid   = [None]
+    participant_var = tk.StringVar(value="")
+    participant_info_var = tk.StringVar(value="Keine Testperson ausgewählt.")
+    video_consent_var = tk.BooleanVar(value=False)
+
     # ── Haupt-Frame ────────────────────────────────────────────────────────────
     main = ttk.Frame(root, padding=18)
     main.pack(fill="both", expand=True)
@@ -1346,7 +1400,83 @@ def show_controller_ui():
     ttk.Label(main, text="Sphero Reha-Controller",
               font=("Segoe UI", 16, "bold")).pack(anchor="w")
     ttk.Label(main, textvariable=status_var,
-              wraplength=430).pack(anchor="w", pady=(6, 12))
+              wraplength=460).pack(anchor="w", pady=(6, 12))
+
+    # ── Testperson auswählen / anlegen ────────────────────────────────────────
+    person_frame = ttk.LabelFrame(main, text=" Testperson ", padding=10)
+    person_frame.pack(fill="x", pady=(0, 12))
+
+    person_row = ttk.Frame(person_frame)
+    person_row.pack(fill="x")
+    person_box = ttk.Combobox(person_row, textvariable=participant_var,
+                              state="readonly", width=34)
+    person_box.pack(side="left", fill="x", expand=True)
+    new_person_button = ttk.Button(person_row, text="➕  Neu")
+    new_person_button.pack(side="left", padx=(8, 0))
+
+    ttk.Label(person_frame, textvariable=participant_info_var,
+              font=("Consolas", 9), foreground="#555",
+              wraplength=440, justify="left").pack(anchor="w", pady=(8, 0))
+
+    video_check = ttk.Checkbutton(
+        person_frame, variable=video_consent_var,
+        text="Videoaufzeichnung dieser Sitzung (freiwillig)")
+    video_check.pack(anchor="w", pady=(8, 0))
+
+    def refresh_person_box():
+        ids = registry.ids()
+        person_box["values"] = [registry.label(pid) for pid in ids]
+        if selected_pid[0] in ids:
+            participant_var.set(registry.label(selected_pid[0]))
+
+    def apply_selection(pid):
+        selected_pid[0] = pid
+        record = registry.get(pid) if pid else None
+        if not record:
+            participant_info_var.set("Keine Testperson ausgewählt.")
+            video_consent_var.set(False)
+            video_check.config(state="disabled")
+            return
+        allowed = record.get("consent", {}).get("video", False)
+        video_check.config(state="normal" if allowed else "disabled")
+        # Standard = das, was die Person bei der Aufnahme zugestimmt hat.
+        # Ohne Zustimmung bleibt die Box zwangsweise aus.
+        video_consent_var.set(bool(allowed))
+        parq_hint = ("PAR-Q: mindestens ein „Ja“ – bitte abklären"
+                     if record.get("parq_any_yes") else "PAR-Q: unauffällig")
+        video_hint = ("Video: eingewilligt" if allowed
+                      else "Video: NICHT eingewilligt – keine Videoaufnahme möglich")
+        participant_info_var.set(
+            f"{record['age_years']} J. (Gruppe {record['age_group']}) | "
+            f"{record['sex']} | {record['handedness']} | "
+            f"Technikaffinität {record['tech_affinity']}/5\n"
+            f"{parq_hint}  |  {video_hint}"
+        )
+
+    def on_person_selected(_event=None):
+        label = participant_var.get()
+        for pid in registry.ids():
+            if registry.label(pid) == label:
+                apply_selection(pid)
+                return
+
+    def new_person_clicked():
+        if recorder.active:
+            messagebox.showwarning(
+                "Aufzeichnung läuft",
+                "Bitte zuerst die laufende Aufzeichnung stoppen.")
+            return
+        pid = probanden.ask_new_participant(root, registry)
+        if pid:
+            refresh_person_box()
+            participant_var.set(registry.label(pid))
+            apply_selection(pid)
+            set_status(f"Testperson {pid} angelegt und ausgewählt.")
+
+    person_box.bind("<<ComboboxSelected>>", on_person_selected)
+    new_person_button.config(command=new_person_clicked)
+    refresh_person_box()
+    apply_selection(None)
 
     # ── Buttons ────────────────────────────────────────────────────────────────
     buttons = ttk.Frame(main)
@@ -1437,13 +1567,28 @@ def show_controller_ui():
 
         if recorder.active:
             elapsed = time.time() - recorder.start_time
-            record_button.config(text="⏹  Aufzeichnung stoppen")
+            record_button.config(text="⏹  Aufzeichnung stoppen", state="normal")
+            # Während der Aufnahme darf die Testperson nicht gewechselt und die
+            # Video-Einwilligung nicht nachträglich verändert werden.
+            person_box.config(state="disabled")
+            video_check.config(state="disabled")
             recording_var.set(
-                f"● Aufzeichnung läuft – {elapsed:0.0f}s  ({os.path.basename(recorder.session_dir)})"
+                f"● Aufzeichnung läuft – {elapsed:0.0f}s  "
+                f"[{recorder.participant_id}"
+                f"{', Video' if recorder.video_consent else ', kein Video'}]"
             )
         else:
-            record_button.config(text="⏺  Aufzeichnung starten")
-            recording_var.set("Keine Aufzeichnung aktiv")
+            has_person = selected_pid[0] is not None
+            record_button.config(text="⏺  Aufzeichnung starten",
+                                 state="normal" if has_person else "disabled")
+            person_box.config(state="readonly")
+            if has_person:
+                allowed = registry.get(selected_pid[0]).get("consent", {}).get("video", False)
+                video_check.config(state="normal" if allowed else "disabled")
+            recording_var.set(
+                "Keine Aufzeichnung aktiv" if has_person
+                else "Keine Aufzeichnung möglich – bitte zuerst Testperson auswählen"
+            )
 
         root.after(200, refresh_ui)
 
@@ -1484,9 +1629,37 @@ def show_controller_ui():
                     "Aufzeichnung gespeichert",
                     f"Sitzung wurde gespeichert unter:\n{session_dir}"
                 )
-        else:
-            start_server_once()
-            recorder.start()
+            return
+
+        pid    = selected_pid[0]
+        record = registry.get(pid) if pid else None
+        if not record:
+            messagebox.showwarning(
+                "Keine Testperson ausgewählt",
+                "Vor der Aufzeichnung muss eine Testperson ausgewählt oder über "
+                "„➕ Neu“ angelegt werden."
+            )
+            return
+
+        # Video nur, wenn die Person eingewilligt hat UND es für diese Sitzung
+        # nicht widerrufen wurde.
+        video = bool(video_consent_var.get()) and record.get("consent", {}).get("video", False)
+
+        if not messagebox.askokcancel(
+            "Aufzeichnung starten",
+            f"Testperson: {pid}  ({record['age_years']} J., Gruppe {record['age_group']})\n\n"
+            f"Aufgezeichnet werden: Sensordaten, Herzfrequenz, Steuerbefehle, "
+            f"Körperwinkel und Abstand.\n"
+            f"Videoaufzeichnung: {'JA' if video else 'NEIN'}\n\n"
+            "Aufzeichnung jetzt starten?"
+        ):
+            return
+
+        start_server_once()
+        session_dir = recorder.start(record, video)
+        if session_dir:
+            set_status(f"Aufzeichnung für {pid} gestartet"
+                       f"{' (mit Video)' if video else ' (ohne Video)'}.")
 
     def on_close():
         stop_sphero_control()
