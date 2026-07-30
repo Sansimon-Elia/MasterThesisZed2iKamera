@@ -14,7 +14,7 @@ import csv
 import os
 import json
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox
 from collections import deque
@@ -24,6 +24,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Sphero
@@ -37,6 +38,64 @@ import probanden
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Referenzuhr – EINE Zeitbasis für Graphen, CSV-Dateien und Video
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MasterClock:
+    """
+    Gemeinsame Zeitbasis für alle Datenquellen der Anwendung.
+
+    Warum nicht einfach time.time()/datetime.now() an jeder Stelle einzeln?
+      1. time.time() ist NICHT monoton. Eine NTP-Korrektur, ein Wechsel der
+         Zeitzone oder die Sommerzeitumstellung lassen die Uhr springen – in
+         einer 20-minütigen Aufnahme reicht ein Sprung, um Video, Sensor-CSV
+         und Graph gegeneinander zu verschieben. Für Zeitdifferenzen wird
+         deshalb ausschließlich perf_counter() (monoton) verwendet.
+      2. Zwei getrennte Uhrenabfragen (einmal für t_rel, einmal für den
+         ISO-Zeitstempel) liefern zwei minimal verschiedene Zeitpunkte. Hier
+         wird pro Messwert genau EIN monotoner Zeitstempel gelesen und die
+         Wanduhrzeit daraus berechnet. Dadurch gilt in jeder Zeile exakt:
+             timestamp == clock_start_iso + t_abs_s
+         und t_rel_s / t_abs_s sind untereinander vergleichbar.
+
+    Zeitfelder, die in allen CSV-Dateien auftauchen:
+      t_abs_s   Sekunden seit Programmstart – gemeinsame Achse aller Quellen,
+                auch über mehrere Aufzeichnungen hinweg (Basis der Live-Graphen)
+      t_rel_s   Sekunden seit Start DIESER Aufzeichnung (0 = Aufnahmebeginn)
+      timestamp Wanduhrzeit als ISO-8601 mit Millisekunden
+    """
+
+    def __init__(self):
+        self._t0_mono = time.perf_counter()
+        self._t0_wall = datetime.now()
+
+    @property
+    def start_wall(self) -> datetime:
+        return self._t0_wall
+
+    def now(self):
+        """Liefert (t_abs_s, Wanduhrzeit) aus EINEM monotonen Zeitstempel."""
+        t_abs = time.perf_counter() - self._t0_mono
+        return t_abs, self._t0_wall + timedelta(seconds=t_abs)
+
+    def t_abs(self) -> float:
+        return time.perf_counter() - self._t0_mono
+
+    def wall_of(self, t_abs: float) -> datetime:
+        """Rechnet eine t_abs-Sekundenangabe in die Wanduhrzeit zurück."""
+        return self._t0_wall + timedelta(seconds=t_abs)
+
+    @staticmethod
+    def iso(wall: datetime) -> str:
+        return wall.isoformat(timespec="milliseconds")
+
+
+# Wird beim Programmstart einmal angelegt und nie zurückgesetzt: nur so bleiben
+# Live-Graph und alle Aufzeichnungen einer Sitzung auf derselben Achse.
+clock = MasterClock()
+
 # ── Windows Event Loop Policy ─────────────────────────────────────────────────
 if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -49,6 +108,7 @@ data_lock      = threading.Lock()
 stop_sphero    = threading.Event()
 stop_camera    = threading.Event()
 server_started = threading.Event()
+
 
 control_thread  = None
 server_thread   = None
@@ -64,9 +124,8 @@ latest_data = {
     "last_update": 0.0,   # time.time() der letzten echten Sensor-POST; 0.0 = noch nie
 }
 
-# Live-Graph-Daten
+# Live-Graph-Daten (Zeitachse = t_abs_s der gemeinsamen Referenzuhr)
 MAX_POINTS        = 300
-graph_start_time  = time.time()
 intensity_values  = deque(maxlen=MAX_POINTS)
 heart_rate_values = deque(maxlen=MAX_POINTS)
 graph_time_values = deque(maxlen=MAX_POINTS)
@@ -75,13 +134,38 @@ graph_time_values = deque(maxlen=MAX_POINTS)
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
 TURN_SPEED_FACTOR    = 0.6
-STOP_TIME            = 1.5
+
+# Wartezeit in Neutralstellung, bis der Stopp-Befehl geht (war 1.5).
+# Kleiner = der Sphero bleibt schneller stehen, wenn die Hand zurückgenommen
+# wird. Zu klein sollte er nicht sein, sonst löst jedes Wackeln um die
+# Neutralschwelle ein Stopp/Start-Paar aus.
+STOP_TIME            = 0.6
+
+# Kippschwellen für die Drehung. Der Betrag der Schwelle ist zugleich der
+# Punkt, ab dem calc_turn() zu drehen beginnt (siehe dort).
+# Links liegt bewusst NIEDRIGER als rechts: Bei am Handgelenk getragener Uhr
+# ist die Drehung in die eine Richtung anatomisch schwerer zu erreichen als in
+# die andere. Wer stattdessen symmetrisch fahren möchte, setzt beide auf 0.80.
 GY_RIGHT_THRESHOLD   = -0.80
-GY_LEFT_THRESHOLD    = +0.80
+GY_LEFT_THRESHOLD    = +0.72
 GX_FORWARD_MAX       = +0.1
 GX_NEUTRAL_THRESHOLD = +0.12
 MAX_TURN_ANGLE       = 90
-TURN_DEADZONE        = 0.80
+
+# ── Reaktionsgeschwindigkeit der Steuerung ────────────────────────────────────
+# Ein Schleifendurchlauf dauert ungefähr ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP,
+# denn sphero.roll() schläft die angegebene Dauer selbst ab. Kleinere Werte
+# heißt: der Sphero setzt Änderungen der Handhaltung schneller um.
+# ACHTUNG, das ist ein Kompromiss: jeder Durchlauf sendet zwei quittierte
+# BLE-Befehle (roll + internes stop_roll). Kürzere Zeiten erhöhen also die
+# Funklast – und hohe Funklast ist genau das, was die Verbindung im
+# Kamerabetrieb abreißen lässt. Gemessen:
+#     0.10 / 0.05  ->  ~150 ms je Durchlauf, ~13 Befehle/s   (bisheriger Stand)
+#     0.07 / 0.04  ->  ~118 ms je Durchlauf, ~17 Befehle/s   (jetzt eingestellt)
+# ERSTE MASSNAHME, falls die Verbindung wieder instabil wird: hier zurück auf
+# 0.1 und 0.05. Das kostet Reaktionsschnelligkeit, aber nichts an der Funktion.
+ROLL_COMMAND_DURATION = 0.07   # Sekunden, die roll() intern wartet
+CONTROL_LOOP_SLEEP    = 0.04   # Sekunden Pause am Ende jedes Durchlaufs
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
 BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
 DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine Daten", bleibt stehen
@@ -90,6 +174,29 @@ DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine
 HR_WARN    = 100
 HR_DANGER  = 120
 SMOOTH_WIN = 10
+
+# ── Video ─────────────────────────────────────────────────────────────────────
+# Bildrate, mit der video.mp4 geschrieben wird. Sie ist NUR nominell: liefert
+# die ZED tatsächlich weniger Bilder (Rechenlast, Body-Tracking), läuft das
+# Video schneller ab als die Realität. Für die Postanalyse ist deshalb
+# video_frames.csv maßgeblich – dort steht zu jedem Bild die exakte Zeit. Die
+# gemessene Bildrate wird zusätzlich in metadata.json festgehalten.
+VIDEO_FPS_NOMINAL = 30.0
+
+# ── Kamera-Qualitätsstufen ────────────────────────────────────────────────────
+# Die hier eingestellte Kombination (NEURAL-Tiefe + ACCURATE-Körpermodell +
+# Body-Fitting bei HD720@30) ist die rechenintensivste, die die ZED 2i anbietet,
+# und erzeugt gleichzeitig die höchste USB3-Datenrate. Beides wirkt auf die
+# Bluetooth-Verbindung: USB3 strahlt im 2,4-GHz-Band, in dem auch BLE arbeitet.
+# Der Fahrbetrieb ist inzwischen gegen dadurch beschädigte Antwortpakete
+# abgesichert (siehe _send_drive_packet). Falls die Störungszählung im Log
+# ("beschaedigte Antwortpakete") dennoch hoch bleibt, sind das hier die
+# Stellschrauben – zuerst DEPTH_MODE, dann das Körpermodell.
+CAM_DEPTH_MODE        = "NEURAL"              # NEURAL | ULTRA | QUALITY | PERFORMANCE
+CAM_BODY_MODEL        = "HUMAN_BODY_ACCURATE"  # ..._ACCURATE | ..._MEDIUM | ..._FAST
+CAM_ENABLE_BODY_FIT   = True
+CAM_RESOLUTION        = "HD720"
+CAM_FPS               = 30
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,24 +224,80 @@ def calc_speed(gx) -> int:
 
 
 def calc_turn(gy_value) -> float:
-    intensity = (abs(gy_value) - TURN_DEADZONE) / (1.0 - TURN_DEADZONE)
+    """
+    Drehwinkel pro Schleifendurchlauf, 0° an der Kippschwelle bis
+    MAX_TURN_ANGLE bei voller Kippung.
+
+    Der Nullpunkt ist die Schwelle DERSELBEN Seite. Vorher stand hier eine
+    gemeinsame Konstante (TURN_DEADZONE = 0.80). Solange beide Schwellen bei
+    0.80 lagen, war das gleichwertig – sobald die linke Schwelle aber tiefer
+    liegt, entstünde dazwischen ein toter Bereich: Der Zustand wäre "links",
+    der Drehwinkel aber 0. Der Sphero würde also in den Kurvenmodus wechseln
+    (langsamer werden, Farbe umschalten), ohne sich zu drehen.
+    """
+    threshold = abs(GY_LEFT_THRESHOLD) if gy_value > 0 else abs(GY_RIGHT_THRESHOLD)
+    span      = max(1.0 - threshold, 1e-6)
+    intensity = (abs(gy_value) - threshold) / span
     return max(0.0, min(1.0, intensity)) * MAX_TURN_ANGLE
 
 
 def moving_average(data: list, window: int) -> np.ndarray:
-    if len(data) < window:
-        return np.array(data)
-    return np.convolve(data, np.ones(window) / window, mode='same')
+    """
+    Nachlaufender (kausaler) gleitender Mittelwert.
+
+    Vorher wurde np.convolve(..., mode='same') verwendet. Das zentriert das
+    Fenster und füllt die Ränder mit Nullen auf – die Kurve wird dadurch am
+    Anfang UND am aktuellen Ende künstlich nach unten gezogen. Im Live-Graph
+    heißt das, dass genau der neueste Messwert zu klein dargestellt wird, und
+    in den gespeicherten Sitzungsdiagrammen entsteht am Rand ein Artefakt, das
+    keine Bewegung abbildet. Jeder Punkt ist hier der Mittelwert der letzten
+    `window` Werte (am Anfang entsprechend über weniger Werte).
+    """
+    arr = np.asarray(data, dtype=float)
+    if arr.size == 0:
+        return arr
+    window = max(1, min(int(window), arr.size))
+    cumsum = np.cumsum(np.insert(arr, 0, 0.0))
+    counts = np.minimum(np.arange(1, arr.size + 1), window)
+    starts = np.maximum(np.arange(arr.size) + 1 - window, 0)
+    return (cumsum[1:] - cumsum[starts]) / counts
+
+
+def valid_hr(hr) -> bool:
+    """
+    Plausibilitätsprüfung der Herzfrequenz.
+
+    Die Uhr sendet 0, solange noch kein Puls gemessen wurde. Diese Nullen
+    dürfen nicht als "0 BPM" in Diagramme oder in den Belastungsindex
+    einfließen – sie sind fehlende Werte, keine Messwerte.
+    """
+    try:
+        return 30.0 <= float(hr) <= 240.0
+    except (TypeError, ValueError):
+        return False
 
 
 def compute_load_index(intensities: list, heart_rates: list) -> list:
+    """
+    Kombinierter Belastungsindex 0–100 aus Bewegungsintensität und Puls.
+
+    Ohne gültige Herzfrequenz ist der Index NICHT definiert und wird als NaN
+    (Lücke in der Kurve) geliefert. Vorher floss eine fehlende Herzfrequenz als
+    0 BPM ein, was den Index systematisch zu niedrig ausgewiesen hat. Ihn
+    stattdessen nur aus der Bewegung zu berechnen wäre genauso falsch: dann
+    stünden in einer Kurve zwei unterschiedlich definierte Größen
+    nebeneinander, die in der Auswertung nicht vergleichbar sind.
+    """
     if not intensities:
         return []
     max_i = max(intensities) if max(intensities) > 0 else 1
     result = []
     for i, hr in zip(intensities, heart_rates):
+        if not valid_hr(hr):
+            result.append(float("nan"))
+            continue
         norm_i  = min(i / max_i, 1.0)
-        norm_hr = max(min((hr - 60) / 120, 1.0), 0)
+        norm_hr = max(min((float(hr) - 60) / 120, 1.0), 0)
         result.append((0.6 * norm_i + 0.4 * norm_hr) * 100)
     return result
 
@@ -145,15 +308,19 @@ def compute_load_index(intensities: list, heart_rates: list) -> list:
 
 SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions")
 
+# Zeitspalten in ALLEN Tabellen (identische Bedeutung, siehe MasterClock):
+#   t_rel_s   Sekunden seit Start dieser Aufzeichnung  → Sync-Schlüssel innerhalb der Sitzung
+#   t_abs_s   Sekunden seit Programmstart              → gemeinsame Achse mit den Live-Graphen
+#   timestamp Wanduhrzeit ISO-8601 mit Millisekunden   → für Berichte und externe Quellen
 _CSV_SCHEMAS = {
-    "sensor":       ["t_rel_s", "timestamp", "gx", "gy", "gz",
+    "sensor":       ["t_rel_s", "t_abs_s", "timestamp", "gx", "gy", "gz",
                       "accel_x", "accel_y", "accel_z", "heart_rate", "intensity"],
-    "control":      ["t_rel_s", "timestamp", "gx", "gy", "gz",
+    "control":      ["t_rel_s", "t_abs_s", "timestamp", "gx", "gy", "gz",
                       "state", "heading_deg", "speed_cmd", "is_stopped"],
-    "tracking":     ["t_rel_s", "timestamp", "person_id", "distance_m",
+    "tracking":     ["t_rel_s", "t_abs_s", "timestamp", "person_id", "distance_m",
                       "angle_left_deg", "angle_right_deg"],
-    "events":       ["t_rel_s", "timestamp", "event", "detail"],
-    "video_frames": ["frame_index", "t_rel_s", "timestamp"],
+    "events":       ["t_rel_s", "t_abs_s", "timestamp", "event", "detail"],
+    "video_frames": ["frame_index", "t_rel_s", "t_abs_s", "timestamp"],
 }
 
 
@@ -179,6 +346,9 @@ class SessionRecorder:
         self.participant_id = None
         self.video_consent  = False
         self._participant   = None
+        self._t_offset      = 0.0   # t_abs der Referenzuhr beim Aufnahmestart
+        self._video_first_t = None
+        self._video_last_t  = None
         self._files         = {}
         self._writers       = {}
         self._counts        = {}
@@ -224,13 +394,19 @@ class SessionRecorder:
             self.session_dir = os.path.join(participant_dir, session_id)
             os.makedirs(os.path.join(self.session_dir, "plots"), exist_ok=True)
 
-            self.start_time  = time.time()
-            self._start_wall = datetime.now().isoformat()
+            # Zeitbasis der Aufnahme: EIN Zugriff auf die Referenzuhr, alles
+            # weitere wird daraus abgeleitet (t_rel_s = t_abs_s - _t_offset).
+            t_abs, wall      = clock.now()
+            self._t_offset   = t_abs
+            self.start_time  = time.time()      # nur für die Anzeige "REC 12s"
+            self._start_wall = MasterClock.iso(wall)
             self._counts     = {name: 0 for name in _CSV_SCHEMAS}
             self._last_flush = 0.0
             self._subsystems_seen = {"sphero": False, "camera": False}
             self._video_writer = None
             self._video_frame_count = 0
+            self._video_first_t = None
+            self._video_last_t  = None
             for key in self._plot:
                 self._plot[key] = []
 
@@ -279,8 +455,13 @@ class SessionRecorder:
     # ── Logging-Methoden (threadsicher) ──────────────────────────────────────
 
     def _now(self):
-        t_rel = time.time() - self.start_time
-        return t_rel, datetime.now().isoformat()
+        """
+        Ein einziger Uhrenzugriff pro Datenzeile – daraus werden alle drei
+        Zeitangaben abgeleitet, sodass sie garantiert denselben Zeitpunkt
+        bezeichnen (siehe MasterClock).
+        """
+        t_abs, wall = clock.now()
+        return t_abs - self._t_offset, t_abs, MasterClock.iso(wall)
 
     def _maybe_flush(self):
         """
@@ -302,9 +483,14 @@ class SessionRecorder:
         with self._lock:
             if not self.active:
                 return
-            t_rel, ts = self._now()
+            t_rel, t_abs, ts = self._now()
+            # Ungültige Herzfrequenz (Uhr sendet 0, solange kein Puls vorliegt)
+            # wird als leeres Feld geschrieben = fehlender Wert (NaN in pandas),
+            # nicht als Messwert 0.
+            hr_out = hr if valid_hr(hr) else ""
             self._writers["sensor"].writerow(
-                [f"{t_rel:.3f}", ts, gx, gy, gz, ax, ay, az, hr, intensity])
+                [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, gx, gy, gz, ax, ay, az,
+                 hr_out, intensity])
             self._counts["sensor"] += 1
             self._plot["t"].append(t_rel)
             self._plot["intensity"].append(intensity)
@@ -318,9 +504,10 @@ class SessionRecorder:
             if not self.active:
                 return
             self._subsystems_seen["sphero"] = True
-            t_rel, ts = self._now()
+            t_rel, t_abs, ts = self._now()
             self._writers["control"].writerow(
-                [f"{t_rel:.3f}", ts, gx, gy, gz, state, heading, speed_cmd, is_stopped])
+                [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, gx, gy, gz,
+                 state, heading, speed_cmd, is_stopped])
             self._counts["control"] += 1
             self._maybe_flush()
 
@@ -331,9 +518,10 @@ class SessionRecorder:
             if not self.active:
                 return
             self._subsystems_seen["camera"] = True
-            t_rel, ts = self._now()
+            t_rel, t_abs, ts = self._now()
             self._writers["tracking"].writerow(
-                [f"{t_rel:.3f}", ts, person_id, distance, angle_left, angle_right])
+                [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, person_id, distance,
+                 angle_left, angle_right])
             self._counts["tracking"] += 1
             self._maybe_flush()
             if distance is not None:
@@ -353,8 +541,9 @@ class SessionRecorder:
     def _log_event_locked(self, event: str, detail: str):
         if "events" not in self._writers:
             return
-        t_rel, ts = self._now()
-        self._writers["events"].writerow([f"{t_rel:.3f}", ts, event, detail])
+        t_rel, t_abs, ts = self._now()
+        self._writers["events"].writerow(
+            [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, event, detail])
         self._files["events"].flush()
         self._counts["events"] += 1
 
@@ -372,22 +561,38 @@ class SessionRecorder:
             if not self.active or not self.video_consent:
                 return
             self._subsystems_seen["camera"] = True
-            t_rel, ts = self._now()
+            t_rel, t_abs, ts = self._now()
 
             if self._video_writer is None:
                 h, w = frame.shape[:2]
                 path = os.path.join(self.session_dir, "video.mp4")
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self._video_writer = cv2.VideoWriter(path, fourcc, 30.0, (w, h))
+                self._video_writer = cv2.VideoWriter(path, fourcc, VIDEO_FPS_NOMINAL, (w, h))
+                self._video_first_t = t_rel
 
             self._video_writer.write(frame)
             self._writers["video_frames"].writerow(
-                [self._video_frame_count, f"{t_rel:.3f}", ts])
+                [self._video_frame_count, f"{t_rel:.3f}", f"{t_abs:.3f}", ts])
+            self._video_last_t = t_rel
             self._video_frame_count += 1
             self._counts["video_frames"] += 1
             self._maybe_flush()
 
     # ── Abschluss: Metadaten + Diagramme ─────────────────────────────────────
+
+    def rec_start_t_abs(self):
+        """t_abs der laufenden Aufzeichnung (für die Markierung im Live-Graph)."""
+        return self._t_offset if self.active else None
+
+    def _measured_fps(self):
+        """Tatsächlich erreichte Bildrate des aufgezeichneten Videos."""
+        if (self._video_first_t is None or self._video_last_t is None
+                or self._video_frame_count < 2):
+            return None
+        span = self._video_last_t - self._video_first_t
+        if span <= 0:
+            return None
+        return round((self._video_frame_count - 1) / span, 2)
 
     def _write_metadata(self, final: bool):
         video_recorded = self.video_consent and self._subsystems_seen["camera"]
@@ -397,8 +602,30 @@ class SessionRecorder:
             "participant": self._participant,
             "video_consent": self.video_consent,
             "start_time_iso": self._start_wall,
-            "end_time_iso": datetime.now().isoformat() if final else None,
-            "duration_s": round(time.time() - self.start_time, 2) if final else None,
+            "end_time_iso": MasterClock.iso(clock.wall_of(clock.t_abs())) if final else None,
+            "duration_s": round(clock.t_abs() - self._t_offset, 3) if final else None,
+            # Alles, was zum Zusammenführen der Quellen in der Postanalyse nötig ist.
+            "time_base": {
+                "columns": {
+                    "t_rel_s": "Sekunden seit Start dieser Aufzeichnung (0 = Aufnahmebeginn)",
+                    "t_abs_s": "Sekunden seit Programmstart (gemeinsame Achse mit den Live-Graphen)",
+                    "timestamp": "Wanduhrzeit ISO-8601 mit Millisekunden",
+                },
+                "clock": "time.perf_counter (monoton); Wanduhrzeit = program_start_iso + t_abs_s",
+                "program_start_iso": MasterClock.iso(clock.start_wall),
+                "session_offset_s": round(self._t_offset, 3),
+                "sync_key": "t_rel_s",
+            },
+            "video": {
+                "consent": self.video_consent,
+                "fps_nominal": VIDEO_FPS_NOMINAL if video_recorded else None,
+                "fps_measured": self._measured_fps() if final else None,
+                "frame_count": self._video_frame_count,
+                "note": ("Bildzeitpunkte stehen in video_frames.csv. Bei Abweichung "
+                         "zwischen fps_nominal und fps_measured ist video.mp4 zeitlich "
+                         "gestaucht/gestreckt – für die Auswertung immer die Zeiten aus "
+                         "video_frames.csv verwenden."),
+            },
             "subsystems_active": self._subsystems_seen,
             "row_counts": dict(self._counts),
             "config": {
@@ -406,8 +633,11 @@ class SessionRecorder:
                 "TURN_SPEED_FACTOR": TURN_SPEED_FACTOR, "STOP_TIME": STOP_TIME,
                 "GY_RIGHT_THRESHOLD": GY_RIGHT_THRESHOLD, "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
                 "GX_FORWARD_MAX": GX_FORWARD_MAX, "GX_NEUTRAL_THRESHOLD": GX_NEUTRAL_THRESHOLD,
-                "MAX_TURN_ANGLE": MAX_TURN_ANGLE, "TURN_DEADZONE": TURN_DEADZONE,
+                "MAX_TURN_ANGLE": MAX_TURN_ANGLE,
+                "ROLL_COMMAND_DURATION": ROLL_COMMAND_DURATION,
+                "CONTROL_LOOP_SLEEP": CONTROL_LOOP_SLEEP,
                 "BACKWARD_DURATION": BACKWARD_DURATION, "BACKWARD_SPEED": BACKWARD_SPEED,
+                "DATA_TIMEOUT": DATA_TIMEOUT,
                 "HR_WARN": HR_WARN, "HR_DANGER": HR_DANGER,
             },
             "files": {
@@ -430,16 +660,21 @@ class SessionRecorder:
             hr  = self._plot["heart_rate"]
             smoothed = moving_average(raw, SMOOTH_WIN)
             load     = compute_load_index(raw, hr)
+            # Fehlende Herzfrequenz als Lücke zeichnen, nicht als 0 BPM.
+            hr_plot  = [float(h) if valid_hr(h) else np.nan for h in hr]
 
             fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-            fig.suptitle("Sitzungs-Übersicht", fontsize=13, fontweight="bold")
+            fig.suptitle(
+                f"Sitzungs-Übersicht – {self.participant_id}   "
+                f"(Start {self._start_wall})",
+                fontsize=13, fontweight="bold")
 
             ax1.plot(t, raw, color="lightsteelblue", alpha=0.5, linewidth=0.8, label="Roh")
             ax1.plot(t, smoothed, color="steelblue", linewidth=1.8, label=f"Geglättet (n={SMOOTH_WIN})")
             ax1.set_title("Bewegungsintensität"); ax1.set_ylabel("Intensität")
             ax1.legend(loc="upper left", fontsize=8); ax1.grid(True, alpha=0.4)
 
-            ax2.plot(t, hr, color="steelblue", linewidth=1.8)
+            ax2.plot(t, hr_plot, color="steelblue", linewidth=1.8)
             ax2.axhline(HR_WARN, color="orange", linestyle="--", linewidth=1.2, label=f"Warnung {HR_WARN} BPM")
             ax2.axhline(HR_DANGER, color="red", linestyle="--", linewidth=1.2, label=f"Gefahr {HR_DANGER} BPM")
             ax2.set_title("Herzfrequenz"); ax2.set_ylabel("BPM")
@@ -492,6 +727,11 @@ def sensorlog():
     
     # ── NEU: Double Tap ist ein reiner Event-POST ohne Sensordaten ──
     if data.get("doubleTap"):
+        # WICHTIG: time.time(), nicht die Referenzuhr. Die Steuerungsschleife
+        # vergleicht backward_until und last_update mit time.time(). Beide Seiten
+        # müssen dieselbe Uhr benutzen – sonst gilt jeder Sensorwert sofort als
+        # veraltet, der Zustand bleibt "neutral" und der Sphero fährt nie los.
+        # (Die Referenzuhr clock.t_abs() bleibt für Graphen und CSV zuständig.)
         now = time.time()
         with data_lock:
             # Watch feuert die Geste manchmal mehrfach kurz hintereinander;
@@ -501,7 +741,11 @@ def sensorlog():
             latest_data["backward_until"] = now + BACKWARD_DURATION
         if is_new_trigger:
             recorder.log_event("double_tap", "Rückwärtsfahrt ausgelöst")
-            print("[EVENT] Double Tap → Rückwärts")
+            # Nur ASCII in der Konsolenausgabe: Auf einer cp1252-Konsole wirft
+            # print() bei Zeichen wie "→" einen UnicodeEncodeError. Da das hier
+            # INNERHALB des Flask-Handlers passiert, würde der Double-Tap-Request
+            # mit HTTP 500 abbrechen und die Rückwärtsfahrt gar nicht auslösen.
+            print("[EVENT] Double Tap - Rueckwaerts")
         return "OK", 200          # ← wichtig: hier beenden!
 
     # Sphero-Steuerung (Schwerkraft)
@@ -515,8 +759,12 @@ def sensorlog():
     ay = float(data.get("motionUserAccelerationY", 0))
     az = float(data.get("motionUserAccelerationZ", 0))
     hr = float(data.get("heartRate", 0))
-    intensity    = math.sqrt(ax**2 + ay**2 + az**2)
-    current_time = time.time() - graph_start_time
+    intensity = math.sqrt(ax**2 + ay**2 + az**2)
+
+    # Zwei Uhren mit klarer Aufgabenteilung:
+    #   time.time()     -> Steuerung (die Schleife vergleicht damit, s.o.)
+    #   clock.t_abs()   -> Graphen und CSV (monotone Referenzuhr, siehe MasterClock)
+    t_abs = clock.t_abs()
 
     with data_lock:
         latest_data["gx"]          = gx
@@ -526,8 +774,9 @@ def sensorlog():
         latest_data["last_update"] = time.time()
         intensity_values.append(intensity)
         heart_rate_values.append(hr)
-        graph_time_values.append(current_time)
+        graph_time_values.append(t_abs)
 
+    recorder.log_sensor(gx, gy, gz, ax, ay, az, hr, intensity)
     return "OK", 200
 
 
@@ -784,7 +1033,8 @@ def control_sphero():
                                 time.sleep(0.3)
                                 was_backward = True
                             backward_heading = (sphero_heading + 180) % 360
-                            guard.call(sphero.roll, int(backward_heading), BACKWARD_SPEED, 0.1)
+                            guard.call(sphero.roll, int(backward_heading), BACKWARD_SPEED,
+                                       ROLL_COMMAND_DURATION)
                             set_led(160, 0, 255)
                             last_move_time = time.time()
                             is_stopped     = False
@@ -799,7 +1049,7 @@ def control_sphero():
                             else:
                                 print(f"[WARN] Rückwärts-Befehl fehlgeschlagen: {e}")
                         recorder.log_control(gx, gy, gz, "backward", sphero_heading, BACKWARD_SPEED, False)
-                        time.sleep(0.05)
+                        time.sleep(CONTROL_LOOP_SLEEP)
                         continue
 
                     was_backward = False
@@ -816,7 +1066,8 @@ def control_sphero():
                             turn           = calc_turn(gy)
                             applied_speed  = int(calc_speed(gx) * TURN_SPEED_FACTOR)
                             sphero_heading = (sphero_heading + turn) % 360
-                            guard.call(sphero.roll, int(sphero_heading), applied_speed, 0.1)
+                            guard.call(sphero.roll, int(sphero_heading), applied_speed,
+                                       ROLL_COMMAND_DURATION)
                             set_led(255, 100, 0)
                             last_move_time = time.time()
                             is_stopped     = False
@@ -827,7 +1078,8 @@ def control_sphero():
                             turn           = calc_turn(gy)
                             applied_speed  = int(calc_speed(gx) * TURN_SPEED_FACTOR)
                             sphero_heading = (sphero_heading - turn) % 360
-                            guard.call(sphero.roll, int(sphero_heading), applied_speed, 0.1)
+                            guard.call(sphero.roll, int(sphero_heading), applied_speed,
+                                       ROLL_COMMAND_DURATION)
                             set_led(0, 200, 255)
                             last_move_time = time.time()
                             is_stopped     = False
@@ -836,7 +1088,8 @@ def control_sphero():
 
                         elif state == "forward":
                             applied_speed = calc_speed(gx)
-                            guard.call(sphero.roll, int(sphero_heading), applied_speed, 0.1)
+                            guard.call(sphero.roll, int(sphero_heading), applied_speed,
+                                       ROLL_COMMAND_DURATION)
                             set_led(0, 255, 0)
                             last_move_time = time.time()
                             is_stopped     = False
@@ -861,7 +1114,7 @@ def control_sphero():
                             print(f"[WARN] Sphero-Befehl fehlgeschlagen: {e}")
 
                     recorder.log_control(gx, gy, gz, state, sphero_heading, applied_speed, is_stopped)
-                    time.sleep(0.05)
+                    time.sleep(CONTROL_LOOP_SLEEP)
 
                 # Sauber beenden wenn gewollt gestoppt
                 if connection_lost:
@@ -1157,10 +1410,10 @@ def run_camera():
 
     zed         = sl.Camera()
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720
-    init_params.camera_fps        = 30
+    init_params.camera_resolution = getattr(sl.RESOLUTION, CAM_RESOLUTION)
+    init_params.camera_fps        = CAM_FPS
     init_params.coordinate_units  = sl.UNIT.METER
-    init_params.depth_mode        = sl.DEPTH_MODE.NEURAL
+    init_params.depth_mode        = getattr(sl.DEPTH_MODE, CAM_DEPTH_MODE)
 
     if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
         set_status("ZED2i: Kamera konnte nicht geöffnet werden.")
@@ -1172,9 +1425,9 @@ def run_camera():
 
     body_params = sl.BodyTrackingParameters()
     body_params.enable_tracking     = True
-    body_params.detection_model     = sl.BODY_TRACKING_MODEL.HUMAN_BODY_ACCURATE
+    body_params.detection_model     = getattr(sl.BODY_TRACKING_MODEL, CAM_BODY_MODEL)
     body_params.body_format         = sl.BODY_FORMAT.BODY_34
-    body_params.enable_body_fitting = True
+    body_params.enable_body_fitting = CAM_ENABLE_BODY_FIT
 
     if zed.enable_body_tracking(body_params) != sl.ERROR_CODE.SUCCESS:
         set_status("ZED2i: Body Tracking konnte nicht aktiviert werden.")
@@ -1256,7 +1509,25 @@ def run_camera():
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LiveGraphWindow:
-    """Öffnet ein Tkinter-Toplevel-Fenster mit eingebetteten Live-Graphen."""
+    """
+    Tkinter-Fenster mit den Live-Graphen.
+
+    Zeitachse: Wanduhrzeit (HH:MM:SS). Intern liegen die Punkte als t_abs_s der
+    gemeinsamen Referenzuhr vor – dieselbe Größe steht als Spalte t_abs_s in
+    jeder CSV-Datei. Die Achsenbeschriftung wird daraus nur zur Anzeige
+    umgerechnet, sodass ein Zeitpunkt im Graph, in den CSV-Dateien und im Video
+    denselben Moment bezeichnet.
+
+    Zeichenweise: Die Kurven werden EINMAL angelegt und danach nur noch mit
+    set_data() gefüttert. Vorher wurde bei jeder Aktualisierung alles verworfen
+    und komplett neu aufgebaut (ax.clear(), plot(), legend(), axhspan() und
+    tight_layout() 5-mal pro Sekunde). tight_layout() ist dabei der teuerste
+    Schritt – der Tk-Mainloop kam nicht mehr nach, wodurch der Graph sichtbar
+    stehen blieb bzw. nur unregelmäßig nachzog.
+    """
+
+    UPDATE_MS   = 200    # Aktualisierungsintervall
+    WINDOW_MIN_S = 20.0  # Mindestbreite des Zeitfensters
 
     def __init__(self, parent: tk.Tk):
         self.win = tk.Toplevel(parent)
@@ -1277,83 +1548,175 @@ class LiveGraphWindow:
         ttk.Label(self.win, textvariable=self.info_var,
                   font=("Consolas", 9), foreground="#555").pack(pady=(0, 4))
 
+        self._build_static_axes()
+
         self._running = True
         self.win.protocol("WM_DELETE_WINDOW", self.close)
         self._update()
 
-    def _update(self):
-        if not self._running:
-            return
+    # ── Einmaliger Aufbau ─────────────────────────────────────────────────────
 
-        with data_lock:
-            n = len(graph_time_values)
-            if n < 2:
-                self.info_var.set("Warte auf Sensordaten vom Handy...")
-                self.win.after(500, self._update)
-                return
-            t   = list(graph_time_values)
-            raw = list(intensity_values)
-            hr  = list(heart_rate_values)
-
-        smoothed = moving_average(raw, SMOOTH_WIN)
-        load     = compute_load_index(raw, hr)
-
-        self.ax1.clear()
-        self.ax2.clear()
-        self.ax3.clear()
-
-        # ── Plot 1: Bewegungsintensität ───────────────────────────────────────
-        self.ax1.plot(t, raw, color='lightsteelblue', alpha=0.5,
-                      linewidth=0.8, label='Roh')
-        self.ax1.plot(t, smoothed, color='steelblue', linewidth=1.8,
-                      label=f'Geglättet (n={SMOOTH_WIN})')
+    def _build_static_axes(self):
+        # Plot 1: Bewegungsintensität
+        self.line_raw,      = self.ax1.plot([], [], color='lightsteelblue',
+                                            alpha=0.5, linewidth=0.8, label='Roh')
+        self.line_smoothed, = self.ax1.plot([], [], color='steelblue', linewidth=1.8,
+                                            label=f'Geglättet (n={SMOOTH_WIN})')
         self.ax1.set_title("Bewegungsintensität")
         self.ax1.set_ylabel("Intensität")
         self.ax1.legend(loc='upper left', fontsize=8)
         self.ax1.grid(True, alpha=0.4)
 
-        # ── Plot 2: Herzfrequenz ──────────────────────────────────────────────
-        self.ax2.plot(t, hr, color='steelblue', linewidth=1.8)
-        self.ax2.axhspan(0,        HR_WARN,   alpha=0.08, color='green')
-        self.ax2.axhspan(HR_WARN,  HR_DANGER, alpha=0.08, color='orange')
-        self.ax2.axhspan(HR_DANGER, 220,      alpha=0.08, color='red')
+        # Plot 2: Herzfrequenz
+        self.ax2.axhspan(0,          HR_WARN,   alpha=0.08, color='green')
+        self.ax2.axhspan(HR_WARN,    HR_DANGER, alpha=0.08, color='orange')
+        self.ax2.axhspan(HR_DANGER,  260,       alpha=0.08, color='red')
         self.ax2.axhline(HR_WARN,   color='orange', linestyle='--',
                          linewidth=1.2, label=f'Warnung {HR_WARN} BPM')
         self.ax2.axhline(HR_DANGER, color='red',    linestyle='--',
                          linewidth=1.2, label=f'Gefahr {HR_DANGER} BPM')
-        if hr:
-            cur_hr = hr[-1]
-            col = 'green' if cur_hr < HR_WARN else ('orange' if cur_hr < HR_DANGER else 'red')
-            self.ax2.text(0.99, 0.95, f'{cur_hr:.0f} BPM',
-                          transform=self.ax2.transAxes, ha='right', va='top',
-                          fontsize=13, fontweight='bold', color=col)
+        self.line_hr, = self.ax2.plot([], [], color='steelblue', linewidth=1.8)
+        self.text_hr  = self.ax2.text(0.99, 0.95, "", transform=self.ax2.transAxes,
+                                      ha='right', va='top', fontsize=13,
+                                      fontweight='bold')
         self.ax2.set_title("Herzfrequenz")
         self.ax2.set_ylabel("BPM")
         self.ax2.legend(loc='upper left', fontsize=8)
         self.ax2.grid(True, alpha=0.4)
 
-        # ── Plot 3: Belastungsindex ───────────────────────────────────────────
-        if load:
-            cur_load  = load[-1]
-            load_col  = 'green' if cur_load < 40 else ('orange' if cur_load < 70 else 'red')
-            self.ax3.plot(t, load, color='steelblue', linewidth=1.8)
-            self.ax3.fill_between(t, load, alpha=0.2, color='steelblue')
-            self.ax3.axhline(40, color='orange', linestyle=':', linewidth=1.0, label='Moderat (40)')
-            self.ax3.axhline(70, color='red',    linestyle=':', linewidth=1.0, label='Hoch (70)')
-            self.ax3.set_ylim(0, 105)
-            self.ax3.text(0.99, 0.95, f'Index: {cur_load:.0f}',
-                          transform=self.ax3.transAxes, ha='right', va='top',
-                          fontsize=13, fontweight='bold', color=load_col)
+        # Plot 3: Belastungsindex
+        self.line_load, = self.ax3.plot([], [], color='steelblue', linewidth=1.8)
+        self.fill_load  = None
+        self.ax3.axhline(40, color='orange', linestyle=':', linewidth=1.0, label='Moderat (40)')
+        self.ax3.axhline(70, color='red',    linestyle=':', linewidth=1.0, label='Hoch (70)')
+        self.text_load  = self.ax3.text(0.99, 0.95, "", transform=self.ax3.transAxes,
+                                        ha='right', va='top', fontsize=13,
+                                        fontweight='bold')
+        self.ax3.set_ylim(0, 105)
         self.ax3.set_title("Belastungsindex (kombiniert)")
-        self.ax3.set_xlabel("Zeit (s)")
+        self.ax3.set_xlabel("Uhrzeit (HH:MM:SS)")
         self.ax3.set_ylabel("Index (0–100)")
         self.ax3.legend(loc='upper left', fontsize=8)
         self.ax3.grid(True, alpha=0.4)
 
+        # Markierung des Aufzeichnungsbeginns – erleichtert später das
+        # Zusammenführen von Graph, Video und CSV.
+        self.rec_markers = []
+        for ax in (self.ax1, self.ax2, self.ax3):
+            marker = ax.axvline(0, color='crimson', linestyle='-', linewidth=1.4,
+                                alpha=0.8, visible=False)
+            self.rec_markers.append(marker)
+
+        # Wanduhrzeit auf der gemeinsamen t_abs-Achse
+        def fmt_time(x, _pos):
+            return clock.wall_of(x).strftime("%H:%M:%S")
+
+        for ax in (self.ax1, self.ax2, self.ax3):
+            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(fmt_time))
+            ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=6))
+
+        # Einmal statt bei jeder Aktualisierung.
         self.fig.tight_layout()
-        self.canvas.draw()
-        self.info_var.set(f"Datenpunkte: {len(t)}  |  Port: 56671")
-        self.win.after(200, self._update)  # ~5 Aktualisierungen/Sek.
+
+    # ── Laufende Aktualisierung ───────────────────────────────────────────────
+
+    def _update(self):
+        if not self._running:
+            return
+        # Ein Fehler in der Zeichenroutine darf die Aktualisierungskette nicht
+        # abreißen lassen. Vorher wurde `after()` erst am ENDE von _update()
+        # aufgerufen – trat davor eine Exception auf, war der Graph endgültig
+        # eingefroren und musste neu geöffnet werden.
+        try:
+            self._redraw()
+        except Exception as e:
+            self.info_var.set(f"Zeichenfehler (Aktualisierung läuft weiter): {e}")
+        if self._running:
+            self.win.after(self.UPDATE_MS, self._update)
+
+    def _redraw(self):
+        with data_lock:
+            if len(graph_time_values) < 2:
+                self.info_var.set("Warte auf Sensordaten vom Handy...")
+                return
+            t   = list(graph_time_values)
+            raw = list(intensity_values)
+            hr  = list(heart_rate_values)
+            rec_active = recorder.active
+            rec_start  = recorder.rec_start_t_abs()
+
+        smoothed = moving_average(raw, SMOOTH_WIN)
+        load     = compute_load_index(raw, hr)
+        # Fehlende Herzfrequenz (0 von der Uhr) als Lücke, nicht als 0 BPM.
+        hr_plot  = np.array([float(h) if valid_hr(h) else np.nan for h in hr])
+
+        # ── Kurven aktualisieren ──────────────────────────────────────────────
+        self.line_raw.set_data(t, raw)
+        self.line_smoothed.set_data(t, smoothed)
+        self.line_hr.set_data(t, hr_plot)
+        self.line_load.set_data(t, load)
+
+        # fill_between erzeugt ein neues Objekt und muss ersetzt werden.
+        if self.fill_load is not None:
+            self.fill_load.remove()
+        self.fill_load = self.ax3.fill_between(t, load, alpha=0.2, color='steelblue')
+
+        # ── Achsen ────────────────────────────────────────────────────────────
+        t_end   = t[-1]
+        t_start = min(t[0], t_end - self.WINDOW_MIN_S)
+        self.ax1.set_xlim(t_start, t_end + 0.5)   # sharex → gilt für alle drei
+
+        max_raw = max(raw) if raw else 1.0
+        self.ax1.set_ylim(0, max(max_raw * 1.15, 0.1))
+
+        valid = hr_plot[~np.isnan(hr_plot)]
+        if valid.size:
+            self.ax2.set_ylim(min(50.0, float(valid.min()) - 10),
+                              max(HR_DANGER + 20.0, float(valid.max()) + 10))
+        else:
+            self.ax2.set_ylim(50, HR_DANGER + 20)
+
+        # ── Aktuelle Werte als Text ───────────────────────────────────────────
+        cur_hr = hr[-1] if hr else 0
+        if valid_hr(cur_hr):
+            col = ('green' if cur_hr < HR_WARN else
+                   'orange' if cur_hr < HR_DANGER else 'red')
+            self.text_hr.set_text(f"{float(cur_hr):.0f} BPM")
+            self.text_hr.set_color(col)
+        else:
+            self.text_hr.set_text("kein Puls")
+            self.text_hr.set_color("#888888")
+
+        cur_load = load[-1] if load else float("nan")
+        if math.isnan(cur_load):
+            # Ohne gültigen Puls ist der Index nicht definiert (siehe
+            # compute_load_index) – das wird angezeigt statt eine Zahl zu erfinden.
+            self.text_load.set_text("Index: –")
+            self.text_load.set_color("#888888")
+        else:
+            self.text_load.set_text(f"Index: {cur_load:.0f}")
+            self.text_load.set_color('green' if cur_load < 40 else
+                                     'orange' if cur_load < 70 else 'red')
+
+        # ── Markierung des Aufzeichnungsbeginns ───────────────────────────────
+        show_marker = rec_active and rec_start is not None and rec_start >= t_start
+        for marker in self.rec_markers:
+            marker.set_visible(bool(show_marker))
+            if show_marker:
+                marker.set_xdata([rec_start, rec_start])
+
+        # draw_idle() statt draw(): zeichnet gebündelt, wenn Tk Luft hat.
+        self.canvas.draw_idle()
+
+        wall_now = clock.wall_of(t_end).strftime("%H:%M:%S.%f")[:-3]
+        if rec_active and rec_start is not None:
+            rec_info = f"REC t_rel={t_end - rec_start:6.1f}s"
+        else:
+            rec_info = "keine Aufzeichnung"
+        self.info_var.set(
+            f"Letzter Wert: {wall_now}  |  t_abs={t_end:8.2f}s  |  "
+            f"{rec_info}  |  Punkte: {len(t)}  |  Port: 56671"
+        )
 
     def close(self):
         self._running = False
