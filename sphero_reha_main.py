@@ -317,8 +317,13 @@ _CSV_SCHEMAS = {
                       "accel_x", "accel_y", "accel_z", "heart_rate", "intensity"],
     "control":      ["t_rel_s", "t_abs_s", "timestamp", "gx", "gy", "gz",
                       "state", "heading_deg", "speed_cmd", "is_stopped"],
+    # Schulterwinkel: Elevation = Hebung des Oberarms gegenüber dem Rumpf,
+    # Ebene = Richtung der Hebung (0° seitlich, 90° nach vorne).
+    # Ellbogenwinkel bleibt als Qualitätskontrolle (Arm gestreckt?) erhalten.
     "tracking":     ["t_rel_s", "t_abs_s", "timestamp", "person_id", "distance_m",
-                      "angle_left_deg", "angle_right_deg"],
+                      "shoulder_elev_left_deg", "shoulder_elev_right_deg",
+                      "shoulder_plane_left_deg", "shoulder_plane_right_deg",
+                      "elbow_left_deg", "elbow_right_deg"],
     "events":       ["t_rel_s", "t_abs_s", "timestamp", "event", "detail"],
     "video_frames": ["frame_index", "t_rel_s", "t_abs_s", "timestamp"],
 }
@@ -511,7 +516,9 @@ class SessionRecorder:
             self._counts["control"] += 1
             self._maybe_flush()
 
-    def log_tracking(self, person_id, distance, angle_left, angle_right):
+    def log_tracking(self, person_id, distance, elev_left, elev_right,
+                     plane_left=None, plane_right=None,
+                     elbow_left=None, elbow_right=None):
         if not self.active:
             return
         with self._lock:
@@ -519,18 +526,25 @@ class SessionRecorder:
                 return
             self._subsystems_seen["camera"] = True
             t_rel, t_abs, ts = self._now()
+            # Fehlende Werte als leeres Feld = NaN in pandas, nicht als 0.
+            def cell(v):
+                return "" if v is None else v
             self._writers["tracking"].writerow(
-                [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, person_id, distance,
-                 angle_left, angle_right])
+                [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, person_id, cell(distance),
+                 cell(elev_left), cell(elev_right),
+                 cell(plane_left), cell(plane_right),
+                 cell(elbow_left), cell(elbow_right)])
             self._counts["tracking"] += 1
             self._maybe_flush()
             if distance is not None:
                 self._plot["dist_t"].append(t_rel)
                 self._plot["distance"].append(distance)
-            if angle_left is not None or angle_right is not None:
+            if elev_left is not None or elev_right is not None:
                 self._plot["angle_t"].append(t_rel)
-                self._plot["angle_left"].append(angle_left)
-                self._plot["angle_right"].append(angle_right)
+                self._plot["angle_left"].append(
+                    elev_left if elev_left is not None else float("nan"))
+                self._plot["angle_right"].append(
+                    elev_right if elev_right is not None else float("nan"))
 
     def log_event(self, event: str, detail: str = ""):
         if not self.active:
@@ -694,9 +708,15 @@ class SessionRecorder:
 
         if self._plot["angle_t"]:
             fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(self._plot["angle_t"], self._plot["angle_left"], label="Links", color="tab:blue")
-            ax.plot(self._plot["angle_t"], self._plot["angle_right"], label="Rechts", color="tab:orange")
-            ax.set_title("Armstreckungswinkel"); ax.set_xlabel("Zeit (s)"); ax.set_ylabel("Grad")
+            ax.plot(self._plot["angle_t"], self._plot["angle_left"],
+                    label="Links", color="tab:blue")
+            ax.plot(self._plot["angle_t"], self._plot["angle_right"],
+                    label="Rechts", color="tab:orange")
+            ax.axhline(SHOULDER_TARGET_DEG, color="green", linestyle="--", linewidth=1.0,
+                       label=f"waagerecht ({SHOULDER_TARGET_DEG:.0f})")
+            ax.set_ylim(0, 185)
+            ax.set_title("Schulterwinkel – Hebung des Oberarms gegenueber dem Rumpf")
+            ax.set_xlabel("Zeit (s)"); ax.set_ylabel("Elevation (Grad)")
             ax.legend(loc="upper left", fontsize=8); ax.grid(True, alpha=0.4)
             fig.tight_layout()
             fig.savefig(os.path.join(plots_dir, "winkel.png"), dpi=150)
@@ -1182,10 +1202,35 @@ def stop_sphero_control():
 
 # Kamera-Hilfsfunktionen (benötigen kein pyzed beim Import)
 
-_WICHTIGE_PUNKTE = {11, 2, 12, 5, 13, 6, 15, 8, 27}
-_HAND_KP     = {8, 15}
-_ARM_KP      = {13, 6}
-_SHOULDER_KP = {5, 12}
+# ── Keypoint-Indizes des ZED-Skeletts BODY_34 ────────────────────────────────
+# Namen statt Zahlen, weil die Zuordnung nicht offensichtlich ist und ein
+# Zahlendreher hier unbemerkt seitenverkehrte Messwerte erzeugt. Die Werte
+# stammen aus sl.BODY_34_PARTS des installierten SDK.
+KP_PELVIS         = 0
+KP_CHEST_SPINE    = 2
+KP_NECK           = 3
+KP_LEFT_SHOULDER  = 5
+KP_LEFT_ELBOW     = 6
+KP_LEFT_WRIST     = 7
+KP_LEFT_HAND      = 8
+KP_RIGHT_SHOULDER = 12
+KP_RIGHT_ELBOW    = 13
+KP_RIGHT_WRIST    = 14
+KP_RIGHT_HAND     = 15
+KP_LEFT_HIP       = 18
+KP_RIGHT_HIP      = 22
+KP_NOSE           = 27
+
+_WICHTIGE_PUNKTE = {
+    KP_PELVIS, KP_CHEST_SPINE, KP_NECK, KP_NOSE,
+    KP_LEFT_SHOULDER, KP_LEFT_ELBOW, KP_LEFT_WRIST, KP_LEFT_HAND,
+    KP_RIGHT_SHOULDER, KP_RIGHT_ELBOW, KP_RIGHT_WRIST, KP_RIGHT_HAND,
+    KP_LEFT_HIP, KP_RIGHT_HIP,
+}
+_HAND_KP     = {KP_LEFT_HAND, KP_RIGHT_HAND}
+_ARM_KP      = {KP_LEFT_ELBOW, KP_RIGHT_ELBOW, KP_LEFT_WRIST, KP_RIGHT_WRIST}
+_SHOULDER_KP = {KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER}
+_TRUNK_KP    = {KP_PELVIS, KP_CHEST_SPINE, KP_NECK, KP_LEFT_HIP, KP_RIGHT_HIP}
 
 _COLOR_HAND    = (0, 255, 0)
 _COLOR_ARM     = (255, 165, 0)
@@ -1196,9 +1241,18 @@ _COLOR_GOOD    = (0, 255, 0)
 _COLOR_WARNING = (0, 165, 255)
 _COLOR_BAD     = (0, 0, 255)
 
+# Anatomisch korrektes Teilskelett. Vorher liefen beide Schultern auf Punkt 11
+# (RIGHT_CLAVICLE) zusammen, wodurch die linke Schulter am rechten Schlüsselbein
+# hing; als "Hals" diente ebenfalls 11 statt NECK.
 _BODY_CONNECTIONS = [
-    (27, 11), (11, 2), (11, 12), (11, 5),
-    (12, 13), (5, 6), (6, 8), (13, 15),
+    (KP_NOSE, KP_NECK), (KP_NECK, KP_CHEST_SPINE),
+    (KP_CHEST_SPINE, KP_PELVIS),
+    (KP_NECK, KP_LEFT_SHOULDER), (KP_NECK, KP_RIGHT_SHOULDER),
+    (KP_LEFT_SHOULDER, KP_LEFT_ELBOW), (KP_LEFT_ELBOW, KP_LEFT_WRIST),
+    (KP_LEFT_WRIST, KP_LEFT_HAND),
+    (KP_RIGHT_SHOULDER, KP_RIGHT_ELBOW), (KP_RIGHT_ELBOW, KP_RIGHT_WRIST),
+    (KP_RIGHT_WRIST, KP_RIGHT_HAND),
+    (KP_PELVIS, KP_LEFT_HIP), (KP_PELVIS, KP_RIGHT_HIP),
 ]
 
 _pygame_ready = False
@@ -1294,28 +1348,169 @@ def _sprich(kategorie: str):
     threading.Thread(target=sprechen, daemon=True).start()
 
 
-def _berechne_winkel_3d(p1, p2, p3):
-    a = np.array([p1[0], p1[1], p1[2]])
-    b = np.array([p2[0], p2[1], p2[2]])
-    c = np.array([p3[0], p3[1], p3[2]])
-    if np.allclose(a, 0) or np.allclose(b, 0) or np.allclose(c, 0):
+# ── Winkelmessung am Schultergelenk ──────────────────────────────────────────
+# Gemessen wird der Elevationswinkel des Oberarms gegenüber dem RUMPF
+# (thorakohumeraler Winkel im Sinne der ISB-Empfehlung, Wu et al. 2005):
+#
+#   Elevation   0° = Arm hängt am Körper
+#              90° = Oberarm waagerecht
+#             180° = Arm senkrecht über dem Kopf
+#
+#   Elevationsebene   0° = seitlich (Abduktion, Frontalebene)
+#                    90° = nach vorne (Flexion, Sagittalebene)
+#                   < 0° = nach hinten (Extension)
+#
+# Warum gegenüber dem Rumpf und nicht gegenüber der Senkrechten der Kamera:
+# Beugt sich die Person vor oder lehnt sie sich zurück, ändert sich der Winkel
+# zur Weltsenkrechten, ohne dass sich im Schultergelenk etwas bewegt hätte.
+# Genau diese Rumpfausweichbewegung ist in der Schulterrehabilitation die
+# typische Kompensation. Ein rumpfbezogener Winkel ist dagegen invariant
+# dagegen und damit zwischen Personen und Sitzungen vergleichbar.
+SHOULDER_TARGET_DEG = 90.0   # ab hier gilt die Hebung als vollständig (waagerecht)
+SHOULDER_MID_DEG    = 45.0   # Zwischenstufe für die Farbrückmeldung
+
+
+def _kp_valid(p) -> bool:
+    """
+    Prüft einen 3D-Keypoint auf Brauchbarkeit.
+
+    Die ZED liefert für nicht erkannte Gelenke entweder exakt (0,0,0) oder NaN.
+    Beides muss aussortiert werden – sonst entstehen Winkel aus Phantompunkten,
+    die in der Auswertung wie echte Messwerte aussehen.
+    """
+    arr = np.asarray(p, dtype=float)[:3]
+    return bool(np.all(np.isfinite(arr))) and not bool(np.allclose(arr, 0.0))
+
+
+def _p3(kps_3d, idx):
+    """Keypoint als 3D-Vektor, oder None wenn unbrauchbar."""
+    if idx >= len(kps_3d):
         return None
-    ba = a - b
-    bc = c - b
-    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
-    return round(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))), 1)
+    p = np.asarray(kps_3d[idx], dtype=float)[:3]
+    return p if _kp_valid(p) else None
+
+
+def _normiere(v):
+    n = np.linalg.norm(v)
+    return None if n < 1e-6 else v / n
+
+
+def _berechne_winkel_3d(p1, p2, p3):
+    """Winkel im Punkt p2 zwischen den Strecken p2→p1 und p2→p3 (Grad)."""
+    a, b, c = (np.asarray(p, dtype=float)[:3] for p in (p1, p2, p3))
+    if not (_kp_valid(a) and _kp_valid(b) and _kp_valid(c)):
+        return None
+    ba, bc = _normiere(a - b), _normiere(c - b)
+    if ba is None or bc is None:
+        return None
+    return round(float(np.degrees(np.arccos(np.clip(np.dot(ba, bc), -1.0, 1.0)))), 1)
+
+
+def _rumpf_koordinatensystem(kps_3d):
+    """
+    Baut ein rechtwinkliges Koordinatensystem aus dem Rumpf der Person.
+
+    Rückgabe (up, right, forward) als Einheitsvektoren, oder None.
+      up      Becken → Hals   (Längsachse des Rumpfes)
+      right   zur rechten Körperseite der Person
+      forward aus der Brust heraus nach vorne
+
+    Die Achsen werden per Gram-Schmidt orthogonalisiert, weil die Schulterlinie
+    nicht exakt senkrecht auf der Rumpfachse steht.
+
+    `forward` wird aus der Nase abgeleitet statt über ein Kreuzprodukt: Das
+    Vorzeichen eines Kreuzprodukts hängt an der Händigkeit des
+    Kamerakoordinatensystems, und diese Anwendung setzt sl.COORDINATE_SYSTEM
+    nicht explizit. Die Nase liegt anatomisch immer vor dem Hals – daraus ergibt
+    sich die Blickrichtung eindeutig und unabhängig vom Koordinatensystem.
+    """
+    becken = _p3(kps_3d, KP_PELVIS)
+    hals   = _p3(kps_3d, KP_NECK)
+    ls     = _p3(kps_3d, KP_LEFT_SHOULDER)
+    rs     = _p3(kps_3d, KP_RIGHT_SHOULDER)
+    if becken is None or hals is None or ls is None or rs is None:
+        return None
+
+    up = _normiere(hals - becken)
+    if up is None:
+        return None
+
+    seitlich = rs - ls                      # zeigt zur rechten Körperseite
+    right = _normiere(seitlich - np.dot(seitlich, up) * up)
+    if right is None:
+        return None
+
+    nase = _p3(kps_3d, KP_NOSE)
+    if nase is not None:
+        vorne = nase - hals
+        forward = _normiere(vorne - np.dot(vorne, up) * up
+                                  - np.dot(vorne, right) * right)
+        if forward is not None:
+            return up, right, forward
+
+    # Ohne Nase: Kreuzprodukt als Rückfallebene. Das Vorzeichen ist dann
+    # koordinatensystemabhängig, deshalb ist nur die Elevation verlässlich,
+    # nicht das Vorzeichen der Elevationsebene.
+    forward = _normiere(np.cross(right, up))
+    return (up, right, forward) if forward is not None else None
+
+
+def berechne_schulterwinkel(kps_3d, seite: str):
+    """
+    Elevationswinkel und Elevationsebene der Schulter (Grad).
+
+    seite: "links" oder "rechts" – anatomische Seite der Person.
+    Rückgabe (elevation, ebene) oder (None, None), wenn Punkte fehlen.
+    """
+    links = seite == "links"
+    schulter_idx = KP_LEFT_SHOULDER if links else KP_RIGHT_SHOULDER
+    ellbogen_idx = KP_LEFT_ELBOW    if links else KP_RIGHT_ELBOW
+
+    schulter = _p3(kps_3d, schulter_idx)
+    ellbogen = _p3(kps_3d, ellbogen_idx)
+    system   = _rumpf_koordinatensystem(kps_3d)
+    if schulter is None or ellbogen is None or system is None:
+        return None, None
+
+    up, right, forward = system
+    oberarm = _normiere(ellbogen - schulter)
+    if oberarm is None:
+        return None, None
+
+    # Elevation gegen die nach UNTEN gerichtete Rumpfachse: hängender Arm = 0°.
+    elevation = float(np.degrees(np.arccos(np.clip(np.dot(oberarm, -up), -1.0, 1.0))))
+
+    # Elevationsebene: Anteile des Oberarms quer zur Rumpfachse.
+    # Für den linken Arm wird die Seitwärtsachse gespiegelt, damit "vom Körper
+    # weg" auf beiden Seiten positiv ist und die Werte direkt vergleichbar sind.
+    seit_vorzeichen = -1.0 if links else 1.0
+    seitwaerts = float(np.dot(oberarm, right)) * seit_vorzeichen
+    vorwaerts  = float(np.dot(oberarm, forward))
+    ebene = float(np.degrees(np.arctan2(vorwaerts, seitwaerts)))
+
+    return round(elevation, 1), round(ebene, 1)
 
 
 def _winkel_farbe(w):
-    if w >= 150: return _COLOR_GOOD
-    if w >= 90:  return _COLOR_WARNING
+    if w >= SHOULDER_TARGET_DEG: return _COLOR_GOOD
+    if w >= SHOULDER_MID_DEG:    return _COLOR_WARNING
     return _COLOR_BAD
 
 
 def _winkel_text(w):
-    if w >= 150: return "Gut gestreckt!"
-    if w >= 90:  return "Weiter strecken..."
-    return "Mehr strecken!"
+    if w >= SHOULDER_TARGET_DEG: return "Gut angehoben!"
+    if w >= SHOULDER_MID_DEG:    return "Weiter anheben..."
+    return "Arm anheben!"
+
+
+def _ebene_text(ebene):
+    """Benennt die Bewegungsebene für die Anzeige."""
+    if ebene is None:
+        return ""
+    if -30 <= ebene <= 30:   return "seitlich"
+    if 30 < ebene < 60:      return "schraeg vorne"
+    if ebene >= 60:          return "vorne"
+    return "nach hinten"
 
 
 def _get_kp_color(idx):
@@ -1342,35 +1537,60 @@ def _draw_skeleton(frame, kps_2d, cv2):
             cv2.circle(frame, (x, y), radius, _get_kp_color(idx), -1)
 
 
-def _draw_winkel(frame, kps_2d, kps_3d, schulter_idx, ellbogen_idx, handgelenk_idx, seite, cv2):
+def _draw_schulterwinkel(frame, kps_2d, kps_3d, seite, cv2):
+    """
+    Zeichnet den Schulterwinkel ein und gibt (elevation, ebene, ellbogen) zurück.
+
+    `seite` ist die anatomische Seite der Person ("links"/"rechts"), nicht die
+    Bildseite. Eine im Bild rechts erscheinende Person hebt ihren LINKEN Arm.
+    """
     h, w = frame.shape[:2]
-    e2d  = kps_2d[ellbogen_idx]
-    ex, ey = int(e2d[0]), int(e2d[1])
-    if not (0 < ex < w and 0 < ey < h):
-        return None
-    winkel = _berechne_winkel_3d(
-        kps_3d[schulter_idx], kps_3d[ellbogen_idx], kps_3d[handgelenk_idx]
-    )
-    if winkel is None:
-        cv2.putText(frame, f"{seite}: Nicht sichtbar",
-                    (20, 80 if seite == "Links" else 120),
+    links = seite == "links"
+    zeile = 80 if links else 120
+    label = "Links " if links else "Rechts"
+
+    schulter_idx = KP_LEFT_SHOULDER if links else KP_RIGHT_SHOULDER
+    ellbogen_idx = KP_LEFT_ELBOW    if links else KP_RIGHT_ELBOW
+    handgel_idx  = KP_LEFT_WRIST    if links else KP_RIGHT_WRIST
+
+    elevation, ebene = berechne_schulterwinkel(kps_3d, seite)
+    # Ellbogenwinkel weiterhin mitgemessen: er zeigt, ob der Arm beim Anheben
+    # gestreckt bleibt, und ist damit die Qualitätskontrolle zur Elevation.
+    ellbogen = _berechne_winkel_3d(kps_3d[schulter_idx], kps_3d[ellbogen_idx],
+                                   kps_3d[handgel_idx]) \
+        if max(schulter_idx, ellbogen_idx, handgel_idx) < len(kps_3d) else None
+
+    if elevation is None:
+        cv2.putText(frame, f"{label}: Schulter nicht sichtbar", (20, zeile),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
-        return None
-    farbe = _winkel_farbe(winkel)
-    cv2.circle(frame, (ex, ey), 14, farbe, -1)
-    cv2.circle(frame, (ex, ey), 14, (255, 255, 255), 2)
-    cv2.putText(frame, f"{winkel}", (ex - 20, ey - 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    cv2.putText(frame, f"{seite}: {winkel} Grad _ {_winkel_text(winkel)}",
-                (20, 80 if seite == "Links" else 120),
+        return None, None, ellbogen
+
+    farbe = _winkel_farbe(elevation)
+
+    # Markierung am Schultergelenk – dort wird der Winkel gemessen.
+    if schulter_idx < len(kps_2d):
+        sx, sy = int(kps_2d[schulter_idx][0]), int(kps_2d[schulter_idx][1])
+        if 0 < sx < w and 0 < sy < h:
+            cv2.circle(frame, (sx, sy), 14, farbe, -1)
+            cv2.circle(frame, (sx, sy), 14, (255, 255, 255), 2)
+            cv2.putText(frame, f"{elevation:.0f}", (sx - 20, sy - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+    text = (f"{label}: {elevation:5.1f} Grad ({_ebene_text(ebene)}) _ "
+            f"{_winkel_text(elevation)}")
+    if ellbogen is not None:
+        text += f"  [Ellbogen {ellbogen:.0f}]"
+    cv2.putText(frame, text, (20, zeile),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, farbe, 2)
-    return winkel
+    return elevation, ebene, ellbogen
 
 
 def _draw_abstand(frame, kps_3d, cv2):
     global _last_distance_condition
-    p = kps_3d[2]
-    if p[2] <= 0:
+    if KP_CHEST_SPINE >= len(kps_3d):
+        return None
+    p = kps_3d[KP_CHEST_SPINE]
+    if not _kp_valid(p) or p[2] <= 0:
         return None
     abstand = p[2]
     if abstand < 1.0:
@@ -1463,16 +1683,16 @@ def run_camera():
                     _draw_skeleton(frame, kps_2d, cv2)
                     distance = _draw_abstand(frame, kps_3d, cv2)
 
-                    angle_left  = _draw_winkel(frame, kps_2d, kps_3d,
-                                 schulter_idx=12, ellbogen_idx=13,
-                                 handgelenk_idx=15, seite="Links", cv2=cv2)
-                    angle_right = _draw_winkel(frame, kps_2d, kps_3d,
-                                 schulter_idx=5, ellbogen_idx=6,
-                                 handgelenk_idx=8, seite="Rechts", cv2=cv2)
+                    elev_l, plane_l, elb_l = _draw_schulterwinkel(
+                        frame, kps_2d, kps_3d, "links", cv2)
+                    elev_r, plane_r, elb_r = _draw_schulterwinkel(
+                        frame, kps_2d, kps_3d, "rechts", cv2)
 
-                    recorder.log_tracking(body.id, distance, angle_left, angle_right)
+                    recorder.log_tracking(body.id, distance,
+                                          elev_l, elev_r, plane_l, plane_r,
+                                          elb_l, elb_r)
 
-                    head = kps_2d[27]
+                    head = kps_2d[KP_NOSE]
                     hx, hy = int(head[0]), int(head[1])
                     if 0 < hx < frame.shape[1]:
                         cv2.putText(frame, f"Person {body.id}",
