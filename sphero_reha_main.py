@@ -173,6 +173,28 @@ MAX_TURN_ANGLE_LEFT  = 60
 #     0.06 / 0.04  ->  ~100 ms je Durchlauf, ~20 Befehle/s   (jetzt eingestellt)
 # ERSTE MASSNAHME, falls die Verbindung wieder instabil wird: hier zurück auf
 # 0.1 und 0.05. Das kostet Reaktionsschnelligkeit, aber nichts an der Funktion.
+# ── Tragearm der Apple Watch ─────────────────────────────────────────────────
+# Wird die Uhr auf den anderen Arm gewechselt und dabei gedreht (Krone zeigt
+# dann in die andere Richtung entlang des Unterarms), liegt das Gerät um 180°
+# um die Displayachse verdreht am Handgelenk. In den Rohdaten kehren sich
+# dadurch zwei der drei Schwerkraftachsen im Vorzeichen um:
+#
+#     gx -> -gx     (Hand oben/unten vertauscht: Stopp und Fahren verwechselt)
+#     gy -> -gy     (Handdrehung vertauscht: links und rechts verwechselt)
+#     gz ->  gz     (Displaynormale bleibt, wird von der Steuerung nicht genutzt)
+#
+# Genau dieses Bild wurde beim Tragen am rechten Arm beobachtet. Die Korrektur
+# rechnet die Werte auf die Bezugslage "linker Arm" um, sodass Steuerung,
+# Schwellen und Aufzeichnung für beide Arme identisch bleiben und die Daten
+# verschiedener Testpersonen ohne Umrechnung vergleichbar sind.
+#
+# Die Transformation ist eine reine Vorzeichenspiegelung und damit verlustfrei
+# umkehrbar: Aus den aufgezeichneten Werten lassen sich die Rohwerte jederzeit
+# zurückrechnen, wenn der in metadata.json vermerkte Tragearm bekannt ist.
+WATCH_ARM_LEFT  = "links"
+WATCH_ARM_RIGHT = "rechts"
+watch_arm = WATCH_ARM_LEFT        # zur Laufzeit über die Oberfläche umschaltbar
+
 ROLL_COMMAND_DURATION = 0.06   # Sekunden, die roll() intern wartet
 CONTROL_LOOP_SLEEP    = 0.04   # Sekunden Pause am Ende jedes Durchlaufs
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
@@ -224,6 +246,22 @@ def get_state(gx, gy, gz) -> str:
     if gx > GX_NEUTRAL_THRESHOLD: return "neutral"
     if gx < GX_FORWARD_MAX:       return "forward"
     return "neutral"
+
+
+def korrigiere_tragearm(gx, gy, gz):
+    """
+    Rechnet die Schwerkraftwerte auf die Bezugslage "linker Arm" um.
+
+    Am rechten Arm liegt die Uhr um 180° um die Displayachse gedreht; gx und gy
+    kehren dadurch ihr Vorzeichen um (Herleitung siehe watch_arm oben). Die
+    Korrektur geschieht bewusst so früh wie möglich – direkt beim Empfang der
+    Sensordaten. Dadurch gelten dieselben Schwellen, dieselbe Lenkung und
+    dieselbe Auswertung für beide Arme, und in der Steuerung selbst muss an
+    keiner Stelle zwischen links und rechts unterschieden werden.
+    """
+    if watch_arm == WATCH_ARM_RIGHT:
+        return -gx, -gy, gz
+    return gx, gy, gz
 
 
 def calc_speed(gx) -> int:
@@ -362,6 +400,7 @@ class SessionRecorder:
         self.participant_id = None
         self.video_consent  = False
         self._participant   = None
+        self._watch_arm     = WATCH_ARM_LEFT
         self._t_offset      = 0.0   # t_abs der Referenzuhr beim Aufnahmestart
         self._video_first_t = None
         self._video_last_t  = None
@@ -400,6 +439,7 @@ class SessionRecorder:
             self.participant_id = participant["participant_id"]
             self.video_consent  = bool(video_consent)
             self._participant   = probanden.analysis_view(participant)
+            self._watch_arm     = watch_arm
 
             # Sitzungen liegen unter sessions/<Teilnehmer-ID>/, damit in der
             # Auswertung alle Aufnahmen einer Person beisammen liegen.
@@ -443,6 +483,7 @@ class SessionRecorder:
             self._log_event_locked("participant", self.participant_id)
             self._log_event_locked(
                 "video_consent", "erteilt" if self.video_consent else "nicht erteilt")
+            self._log_event_locked("watch_arm", self._watch_arm)
             return self.session_dir
 
     def stop(self):
@@ -626,6 +667,13 @@ class SessionRecorder:
             "participant_id": self.participant_id,
             "participant": self._participant,
             "video_consent": self.video_consent,
+            # Tragearm der Uhr beim Start der Aufzeichnung. Wichtig für die
+            # Postanalyse: gx/gy in sensor.csv sind auf die Bezugslage
+            # "linker Arm" normiert (siehe korrigiere_tragearm). Bei "rechts"
+            # ergeben sich die Rohwerte der Uhr durch erneutes Umkehren der
+            # Vorzeichen von gx und gy.
+            "watch_arm": self._watch_arm,
+            "gravity_frame": "normiert auf linken Arm",
             "start_time_iso": self._start_wall,
             "end_time_iso": MasterClock.iso(clock.wall_of(clock.t_abs())) if final else None,
             "duration_s": round(clock.t_abs() - self._t_offset, 3) if final else None,
@@ -780,10 +828,12 @@ def sensorlog():
             print("[EVENT] Double Tap - Rueckwaerts")
         return "OK", 200          # ← wichtig: hier beenden!
 
-    # Sphero-Steuerung (Schwerkraft)
-    gx    = float(data.get("gravityX", 0))
-    gy    = float(data.get("gravityY", 0))
-    gz    = float(data.get("gravityZ", 0))
+    # Sphero-Steuerung (Schwerkraft). Erst auf den Tragearm normieren, danach
+    # arbeiten Steuerung, Anzeige und Aufzeichnung durchgehend mit denselben
+    # Bezugsachsen – unabhängig davon, an welchem Arm die Uhr sitzt.
+    gx, gy, gz = korrigiere_tragearm(float(data.get("gravityX", 0)),
+                                     float(data.get("gravityY", 0)),
+                                     float(data.get("gravityZ", 0)))
     state = get_state(gx, gy, gz)
 
     # Live-Graph (Beschleunigung + Herzfrequenz)
@@ -2197,8 +2247,8 @@ class SteeringTuneWindow:
 def show_controller_ui():
     root = tk.Tk()
     root.title("Sphero Reha-Controller")
-    root.geometry("520x570")
-    root.minsize(460, 520)
+    root.geometry("520x700")
+    root.minsize(460, 600)
     root.resizable(True, True)
 
     status_var  = tk.StringVar(value=last_status)
@@ -2330,6 +2380,38 @@ def show_controller_ui():
     buttons.columnconfigure(0, weight=1)
     buttons.columnconfigure(1, weight=1)
 
+    # ── Tragearm der Uhr ──────────────────────────────────────────────────────
+    # Bewusst hier bei der Steuerung und NICHT bei den Probandendaten: Es ist
+    # eine Einstellung des Geräts, keine Eigenschaft der Person, und sie muss
+    # auch ohne ausgewählte Testperson (freies Testen) verstellbar sein.
+    # Jederzeit umschaltbar, damit der Arm im laufenden Betrieb gewechselt
+    # werden kann, ohne die Steuerung neu zu starten.
+    arm_frame = ttk.LabelFrame(main, text=" Apple Watch getragen am ", padding=8)
+    arm_frame.pack(fill="x", pady=(10, 0))
+
+    arm_var = tk.StringVar(value=watch_arm)
+
+    def arm_geaendert():
+        global watch_arm
+        neu = arm_var.get()
+        if neu == watch_arm:
+            return
+        watch_arm = neu
+        recorder.log_event("watch_arm_changed", neu)
+        set_status(f"Uhr wird am {neu}en Arm getragen – Achsen entsprechend umgerechnet.")
+
+    arm_row = ttk.Frame(arm_frame)
+    arm_row.pack(fill="x")
+    ttk.Radiobutton(arm_row, text="linker Arm", value=WATCH_ARM_LEFT,
+                    variable=arm_var, command=arm_geaendert).pack(side="left")
+    ttk.Radiobutton(arm_row, text="rechter Arm", value=WATCH_ARM_RIGHT,
+                    variable=arm_var, command=arm_geaendert).pack(side="left", padx=(16, 0))
+    ttk.Label(arm_frame,
+              text="Am rechten Arm liegt die Uhr um 180° gedreht am Handgelenk. "
+                   "Ohne diese Angabe wären Fahren/Stopp und Links/Rechts vertauscht.",
+              foreground="#777", wraplength=430,
+              justify="left").pack(anchor="w", pady=(4, 0))
+
     recording_var = tk.StringVar(value="Keine Aufzeichnung aktiv")
     ttk.Label(main, textvariable=recording_var,
               font=("Consolas", 9), foreground="#aa0000").pack(anchor="w", pady=(4, 0))
@@ -2375,7 +2457,10 @@ def show_controller_ui():
             heading     = latest_data["heading"]
             status_text = last_status
 
-        sensor_var.set(f"gX={gx:+.2f}  gY={gy:+.2f}  gZ={gz:+.2f}")
+        # Angezeigt werden die bereits auf den Tragearm normierten Werte –
+        # dieselben, mit denen die Steuerung rechnet.
+        sensor_var.set(f"gX={gx:+.2f}  gY={gy:+.2f}  gZ={gz:+.2f}   "
+                       f"(Uhr {watch_arm})")
         status_var.set(status_text)
         heading_var.set(f"Heading: {int(heading)}°")
 
