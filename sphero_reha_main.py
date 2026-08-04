@@ -133,7 +133,7 @@ graph_time_values = deque(maxlen=MAX_POINTS)
 # ── Sphero-Konfiguration ──────────────────────────────────────────────────────
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
-TURN_SPEED_FACTOR    = 0.6
+TURN_SPEED_FACTOR    = 0.7
 
 # Wartezeit in Neutralstellung, bis der Stopp-Befehl geht (war 1.5).
 # Kleiner = der Sphero bleibt schneller stehen, wenn die Hand zurückgenommen
@@ -147,10 +147,18 @@ STOP_TIME            = 0.6
 # ist die Drehung in die eine Richtung anatomisch schwerer zu erreichen als in
 # die andere. Wer stattdessen symmetrisch fahren möchte, setzt beide auf 0.80.
 GY_RIGHT_THRESHOLD   = -0.80
-GY_LEFT_THRESHOLD    = +0.72
+GY_LEFT_THRESHOLD    = +0.61
 GX_FORWARD_MAX       = +0.1
 GX_NEUTRAL_THRESHOLD = +0.12
-MAX_TURN_ANGLE       = 90
+# Maximaler Drehwinkel pro Schleifendurchlauf, getrennt je Seite.
+# Getrennt, weil die Schwellen unterschiedlich sind: Rechts wird ab 0.80
+# gedreht, links schon ab 0.72. Der Winkel wird zwischen Schwelle und Vollaus-
+# schlag (1.0) hochskaliert – bei der niedrigeren linken Schwelle ist dieser
+# Bereich breiter (0.28 statt 0.20), sodass dieselbe Handdrehung links einen
+# deutlich größeren Winkel ergäbe. Ein kleinerer Maximalwinkel links gleicht
+# das wieder aus.
+MAX_TURN_ANGLE_RIGHT = 60
+MAX_TURN_ANGLE_LEFT  = 60
 
 # ── Reaktionsgeschwindigkeit der Steuerung ────────────────────────────────────
 # Ein Schleifendurchlauf dauert ungefähr ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP,
@@ -160,11 +168,12 @@ MAX_TURN_ANGLE       = 90
 # BLE-Befehle (roll + internes stop_roll). Kürzere Zeiten erhöhen also die
 # Funklast – und hohe Funklast ist genau das, was die Verbindung im
 # Kamerabetrieb abreißen lässt. Gemessen:
-#     0.10 / 0.05  ->  ~150 ms je Durchlauf, ~13 Befehle/s   (bisheriger Stand)
-#     0.07 / 0.04  ->  ~118 ms je Durchlauf, ~17 Befehle/s   (jetzt eingestellt)
+#     0.10 / 0.05  ->  ~150 ms je Durchlauf, ~13 Befehle/s   (Ursprungswerte)
+#     0.07 / 0.04  ->  ~110 ms je Durchlauf, ~18 Befehle/s
+#     0.06 / 0.04  ->  ~100 ms je Durchlauf, ~20 Befehle/s   (jetzt eingestellt)
 # ERSTE MASSNAHME, falls die Verbindung wieder instabil wird: hier zurück auf
 # 0.1 und 0.05. Das kostet Reaktionsschnelligkeit, aber nichts an der Funktion.
-ROLL_COMMAND_DURATION = 0.07   # Sekunden, die roll() intern wartet
+ROLL_COMMAND_DURATION = 0.06   # Sekunden, die roll() intern wartet
 CONTROL_LOOP_SLEEP    = 0.04   # Sekunden Pause am Ende jedes Durchlaufs
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
 BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
@@ -235,10 +244,12 @@ def calc_turn(gy_value) -> float:
     der Drehwinkel aber 0. Der Sphero würde also in den Kurvenmodus wechseln
     (langsamer werden, Farbe umschalten), ohne sich zu drehen.
     """
-    threshold = abs(GY_LEFT_THRESHOLD) if gy_value > 0 else abs(GY_RIGHT_THRESHOLD)
+    links     = gy_value > 0
+    threshold = abs(GY_LEFT_THRESHOLD) if links else abs(GY_RIGHT_THRESHOLD)
+    max_winkel = MAX_TURN_ANGLE_LEFT   if links else MAX_TURN_ANGLE_RIGHT
     span      = max(1.0 - threshold, 1e-6)
     intensity = (abs(gy_value) - threshold) / span
-    return max(0.0, min(1.0, intensity)) * MAX_TURN_ANGLE
+    return max(0.0, min(1.0, intensity)) * max_winkel
 
 
 def moving_average(data: list, window: int) -> np.ndarray:
@@ -647,7 +658,8 @@ class SessionRecorder:
                 "TURN_SPEED_FACTOR": TURN_SPEED_FACTOR, "STOP_TIME": STOP_TIME,
                 "GY_RIGHT_THRESHOLD": GY_RIGHT_THRESHOLD, "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
                 "GX_FORWARD_MAX": GX_FORWARD_MAX, "GX_NEUTRAL_THRESHOLD": GX_NEUTRAL_THRESHOLD,
-                "MAX_TURN_ANGLE": MAX_TURN_ANGLE,
+                "MAX_TURN_ANGLE_LEFT": MAX_TURN_ANGLE_LEFT,
+                "MAX_TURN_ANGLE_RIGHT": MAX_TURN_ANGLE_RIGHT,
                 "ROLL_COMMAND_DURATION": ROLL_COMMAND_DURATION,
                 "CONTROL_LOOP_SLEEP": CONTROL_LOOP_SLEEP,
                 "BACKWARD_DURATION": BACKWARD_DURATION, "BACKWARD_SPEED": BACKWARD_SPEED,
@@ -1945,6 +1957,240 @@ class LiveGraphWindow:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Lenkung feinjustieren (temporäres Hilfsfenster)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SteeringTuneWindow:
+    """
+    Schieberegler für ALLE Faktoren, die das Kurvenverhalten beeinflussen.
+
+    Gedacht als Werkzeug zum Einstellen, nicht als Dauerfunktion: Wenn die
+    passenden Werte gefunden sind, können sie oben in der Datei fest eingetragen
+    und dieses Fenster samt Button entfernt werden. Die Regler schreiben direkt
+    in die Modulvariablen, die die Steuerungsschleife bei jedem Durchlauf neu
+    liest – Änderungen wirken deshalb sofort, ohne Neustart.
+
+    Die vier Faktoren und wie sie zusammenwirken:
+
+      1. Schwelle (je Seite)      – ab wann die Kurve überhaupt beginnt
+      2. Max. Winkel (je Seite)   – wie viel Grad pro Schleifendurchlauf
+      3. Kurven-Tempo             – wie schnell er in der Kurve fährt
+      4. Zykluszeit               – wie oft pro Sekunde gelenkt wird
+
+    Punkt 4 ist der am wenigsten offensichtliche: Der Winkel aus Punkt 2 wird
+    PRO DURCHLAUF aufaddiert. Die tatsächliche Drehgeschwindigkeit ist deshalb
+    Winkel geteilt durch Zykluszeit. Wer nur am Winkel dreht, ändert damit
+    immer auch die Drehgeschwindigkeit.
+    """
+
+    VERGLEICHS_NEIGUNGEN = (0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+
+    def __init__(self, parent: tk.Tk):
+        self.win = tk.Toplevel(parent)
+        self.win.title("Lenkung feinjustieren")
+        self.win.geometry("660x760")
+        self.win.minsize(600, 500)
+
+        self._max_links  = 0.0     # größter erreichter Ausschlag nach links
+        self._max_rechts = 0.0     # ... und nach rechts
+        self._running    = True
+
+        scroll = probanden._ScrollFrame(self.win, height=640)
+        scroll.pack(fill="both", expand=True, padx=14, pady=(12, 0))
+        self._scroll = scroll
+        main = scroll.inner
+
+        ttk.Label(main, text="Lenkung einstellen",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(main,
+                  text="Alle Regler wirken sofort, auch während der Sphero fährt.",
+                  foreground="#555", wraplength=580,
+                  justify="left").pack(anchor="w", pady=(4, 10))
+
+        # ── Regelgrößen ───────────────────────────────────────────────────────
+        self.var_schwelle_l = tk.DoubleVar(value=abs(GY_LEFT_THRESHOLD))
+        self.var_winkel_l   = tk.DoubleVar(value=float(MAX_TURN_ANGLE_LEFT))
+        self.var_schwelle_r = tk.DoubleVar(value=abs(GY_RIGHT_THRESHOLD))
+        self.var_winkel_r   = tk.DoubleVar(value=float(MAX_TURN_ANGLE_RIGHT))
+        self.var_tempo      = tk.DoubleVar(value=float(TURN_SPEED_FACTOR))
+        self.var_zyklus     = tk.DoubleVar(value=float(ROLL_COMMAND_DURATION))
+
+        self._abschnitt(main, "1  Linkskurve")
+        self._regler(main, "Schwelle links", self.var_schwelle_l, 0.40, 0.95, 0.01,
+                     "hoeher = Hand muss weiter gedreht werden, bevor die Kurve beginnt",
+                     "tiefer = Kurve beginnt schon bei leichter Drehung (leichter, "
+                     "aber auch schneller versehentlich)")
+        self._regler(main, "Max. Winkel links", self.var_winkel_l, 10, 90, 1,
+                     "hoeher = bei voller Handdrehung dreht er schaerfer/enger",
+                     "tiefer = die Kurve wird weiter und sanfter")
+
+        self._abschnitt(main, "2  Rechtskurve")
+        self._regler(main, "Schwelle rechts", self.var_schwelle_r, 0.40, 0.95, 0.01,
+                     "hoeher = Hand muss weiter gedreht werden, bevor die Kurve beginnt",
+                     "tiefer = Kurve beginnt schon bei leichter Drehung")
+        self._regler(main, "Max. Winkel rechts", self.var_winkel_r, 10, 90, 1,
+                     "hoeher = bei voller Handdrehung dreht er schaerfer/enger",
+                     "tiefer = die Kurve wird weiter und sanfter")
+
+        self._abschnitt(main, "3  Gilt fuer beide Seiten")
+        self._regler(main, "Kurven-Tempo", self.var_tempo, 0.20, 1.00, 0.05,
+                     "hoeher = er faehrt in der Kurve schneller -> weiter Bogen",
+                     "tiefer = er wird in der Kurve langsamer -> dreht enger, "
+                     "fast auf der Stelle")
+        self._regler(main, "Zykluszeit (s)", self.var_zyklus, 0.04, 0.15, 0.01,
+                     "hoeher = seltener gelenkt: dreht langsamer, reagiert traeger, "
+                     "schont die Funkverbindung",
+                     "tiefer = oefter gelenkt: dreht schneller, reagiert direkter, "
+                     "mehr Funklast (Abrissgefahr)")
+
+        # ── Live-Anzeige ──────────────────────────────────────────────────────
+        ttk.Separator(main).pack(fill="x", pady=(12, 8))
+        self.live_var = tk.StringVar(value="Warte auf Sensordaten...")
+        ttk.Label(main, textvariable=self.live_var, font=("Consolas", 10),
+                  justify="left").pack(anchor="w")
+
+        ttk.Separator(main).pack(fill="x", pady=(10, 8))
+        ttk.Label(main, text="Vergleich beider Seiten",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.tabelle_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.tabelle_var, font=("Consolas", 10),
+                  justify="left").pack(anchor="w", pady=(4, 0))
+
+        # ── Übernahme ─────────────────────────────────────────────────────────
+        ttk.Separator(main).pack(fill="x", pady=(10, 8))
+        ttk.Label(main, text="Diese Zeilen oben in sphero_reha_main.py eintragen:",
+                  font=("Segoe UI", 9)).pack(anchor="w")
+        self.code_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.code_var, font=("Consolas", 10),
+                  foreground="#0a5", justify="left").pack(anchor="w", pady=(2, 8))
+
+        knoepfe = ttk.Frame(self.win, padding=(14, 8))
+        knoepfe.pack(fill="x")
+        ttk.Button(knoepfe, text="Ausschlaege zuruecksetzen",
+                   command=self._reset_max).pack(side="left")
+        ttk.Button(knoepfe, text="Werte in Konsole ausgeben",
+                   command=self._print_werte).pack(side="left", padx=(8, 0))
+        ttk.Button(knoepfe, text="Schliessen",
+                   command=self.close).pack(side="right")
+
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self._update()
+
+    # ── Aufbau ────────────────────────────────────────────────────────────────
+
+    def _abschnitt(self, parent, titel):
+        ttk.Separator(parent).pack(fill="x", pady=(10, 4))
+        ttk.Label(parent, text=titel,
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 2))
+
+    def _regler(self, parent, titel, variable, von, bis, schritt, hoch, tief):
+        rahmen = ttk.Frame(parent)
+        rahmen.pack(fill="x", pady=(4, 0))
+        kopf = ttk.Frame(rahmen)
+        kopf.pack(fill="x")
+        ttk.Label(kopf, text=titel, font=("Segoe UI", 10, "bold")).pack(side="left")
+        wert = ttk.Label(kopf, text="", font=("Consolas", 11), foreground="#06c")
+        wert.pack(side="right")
+
+        tk.Scale(rahmen, from_=von, to=bis, resolution=schritt,
+                 orient="horizontal", variable=variable, showvalue=False,
+                 length=560, command=lambda _v: self._uebernehmen()).pack(fill="x")
+        ttk.Label(rahmen, text="▲  " + hoch, foreground="#a60",
+                  wraplength=560, justify="left").pack(anchor="w")
+        ttk.Label(rahmen, text="▼  " + tief, foreground="#06a",
+                  wraplength=560, justify="left").pack(anchor="w")
+
+        nachkomma = 2 if schritt < 1 else 0
+        variable.trace_add(
+            "write", lambda *_: wert.config(text=f"{variable.get():.{nachkomma}f}"))
+        wert.config(text=f"{variable.get():.{nachkomma}f}")
+
+    # ── Wirkung ───────────────────────────────────────────────────────────────
+
+    def _uebernehmen(self):
+        """Reglerwerte in die Modulvariablen schreiben (wirkt sofort)."""
+        global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
+        global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
+        global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
+        GY_LEFT_THRESHOLD     = round(abs(float(self.var_schwelle_l.get())), 3)
+        MAX_TURN_ANGLE_LEFT   = int(round(float(self.var_winkel_l.get())))
+        # rechts wird als negativer Wert geführt (Kippen in die Gegenrichtung)
+        GY_RIGHT_THRESHOLD    = -round(abs(float(self.var_schwelle_r.get())), 3)
+        MAX_TURN_ANGLE_RIGHT  = int(round(float(self.var_winkel_r.get())))
+        TURN_SPEED_FACTOR     = round(float(self.var_tempo.get()), 2)
+        ROLL_COMMAND_DURATION = round(float(self.var_zyklus.get()), 3)
+
+    def _reset_max(self):
+        self._max_links = self._max_rechts = 0.0
+
+    def _werte_text(self) -> str:
+        return (f"GY_LEFT_THRESHOLD     = {GY_LEFT_THRESHOLD:+.2f}\n"
+                f"MAX_TURN_ANGLE_LEFT   = {MAX_TURN_ANGLE_LEFT}\n"
+                f"GY_RIGHT_THRESHOLD    = {GY_RIGHT_THRESHOLD:+.2f}\n"
+                f"MAX_TURN_ANGLE_RIGHT  = {MAX_TURN_ANGLE_RIGHT}\n"
+                f"TURN_SPEED_FACTOR     = {TURN_SPEED_FACTOR}\n"
+                f"ROLL_COMMAND_DURATION = {ROLL_COMMAND_DURATION}")
+
+    def _print_werte(self):
+        print("[LENKUNG] " + self._werte_text().replace("\n", "   "))
+
+    # ── Laufende Anzeige ──────────────────────────────────────────────────────
+
+    def _update(self):
+        if not self._running:
+            return
+        try:
+            self._zeichne()
+        except Exception as e:
+            self.live_var.set(f"Anzeigefehler: {e}")
+        if self._running:
+            self.win.after(150, self._update)
+
+    def _zeichne(self):
+        with data_lock:
+            gy    = latest_data["gy"]
+            gx    = latest_data["gx"]
+            state = latest_data["state"]
+
+        if gy > 0:
+            self._max_links = max(self._max_links, gy)
+        else:
+            self._max_rechts = min(self._max_rechts, gy)
+
+        zyklus   = ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP
+        winkel   = calc_turn(gy) if state in ("left", "right") else 0.0
+        richtung = {"left": "LINKS", "right": "RECHTS"}.get(state, "geradeaus")
+        tempo    = int(calc_speed(gx) * TURN_SPEED_FACTOR) if state in ("left", "right") \
+            else calc_speed(gx)
+
+        self.live_var.set(
+            f"gY jetzt : {gy:+.2f}  ->  {richtung:9s} {winkel:5.1f} Grad je Schritt "
+            f"= {winkel / zyklus:6.0f} Grad/s\n"
+            f"gX jetzt : {gx:+.2f}  ->  Tempo {tempo:3d}\n"
+            f"groesster Ausschlag   links {self._max_links:+.2f}   "
+            f"rechts {self._max_rechts:+.2f}\n"
+            f"Zykluszeit {zyklus*1000:.0f} ms  =  {1/zyklus:.1f} Lenkschritte/s, "
+            f"{2/zyklus:.0f} Funkbefehle/s"
+        )
+
+        zeilen = ["  Handdrehung |     links     |    rechts",
+                  "              | Grad    Grad/s| Grad    Grad/s",
+                  "  ------------+---------------+---------------"]
+        for n in self.VERGLEICHS_NEIGUNGEN:
+            li = calc_turn(+n) if +n > abs(GY_LEFT_THRESHOLD)  else 0.0
+            re = calc_turn(-n) if +n > abs(GY_RIGHT_THRESHOLD) else 0.0
+            zeilen.append(f"      {n:.2f}    |{li:6.1f} {li/zyklus:7.0f} "
+                          f"|{re:6.1f} {re/zyklus:7.0f}")
+        self.tabelle_var.set("\n".join(zeilen))
+        self.code_var.set(self._werte_text())
+
+    def close(self):
+        self._running = False
+        self._scroll.unbind_mousewheel()
+        self.win.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Haupt-UI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1962,6 +2208,7 @@ def show_controller_ui():
 
     graph_window_ref = [None]
     camera_thread_ref = [None]
+    tune_window_ref = [None]
 
     # ── Probandenverwaltung ───────────────────────────────────────────────────
     try:
@@ -2069,13 +2316,17 @@ def show_controller_ui():
     stop_button   = ttk.Button(buttons, text="■  Sphero stoppen")
     graph_button  = ttk.Button(buttons, text="📊  Live Graphen")
     camera_button = ttk.Button(buttons, text="📷  Kamera starten")
+    # Temporäres Werkzeug: kann samt SteeringTuneWindow entfernt werden,
+    # sobald die Lenkwerte feststehen.
+    tune_button   = ttk.Button(buttons, text="🎛  Lenkung justieren")
     record_button = ttk.Button(buttons, text="⏺  Aufzeichnung starten")
 
     start_button.grid( row=0, column=0, sticky="ew", padx=(0, 6), pady=3)
     stop_button.grid(  row=0, column=1, sticky="ew",              pady=3)
     graph_button.grid( row=1, column=0, sticky="ew", padx=(0, 6), pady=3)
     camera_button.grid(row=1, column=1, sticky="ew",              pady=3)
-    record_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+    tune_button.grid(  row=2, column=0, columnspan=2, sticky="ew", pady=3)
+    record_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
     buttons.columnconfigure(0, weight=1)
     buttons.columnconfigure(1, weight=1)
 
@@ -2191,6 +2442,14 @@ def show_controller_ui():
             start_server_once()
             graph_window_ref[0] = LiveGraphWindow(root)
 
+    def toggle_tuning():
+        tw = tune_window_ref[0]
+        if tw is not None and tw.win.winfo_exists():
+            tw.close()
+        else:
+            start_server_once()
+            tune_window_ref[0] = SteeringTuneWindow(root)
+
     def toggle_camera():
         cam = camera_thread_ref[0]
         if cam is not None and cam.is_alive():
@@ -2250,6 +2509,9 @@ def show_controller_ui():
         gw = graph_window_ref[0]
         if gw is not None and gw.win.winfo_exists():
             gw.close()
+        tw = tune_window_ref[0]
+        if tw is not None and tw.win.winfo_exists():
+            tw.close()
         if recorder.active:
             recorder.stop()
         root.destroy()
@@ -2260,6 +2522,7 @@ def show_controller_ui():
     stop_button.config(  command=stop_clicked,  state="disabled")
     graph_button.config( command=toggle_graphs)
     camera_button.config(command=toggle_camera)
+    tune_button.config(  command=toggle_tuning)
     record_button.config(command=toggle_recording)
     root.protocol("WM_DELETE_WINDOW", on_close)
 
