@@ -34,6 +34,8 @@ from spherov2.types import Color
 
 # Probandenverwaltung (pseudonymisierte Stammdaten + Eingabemaske)
 import probanden
+# Vibrationsgürtel (feelSpace naviBelt) – optional, wird nur bei Bedarf genutzt
+import guertel
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
@@ -401,6 +403,7 @@ class SessionRecorder:
         self.video_consent  = False
         self._participant   = None
         self._watch_arm     = WATCH_ARM_LEFT
+        self._belt_active   = False
         self._t_offset      = 0.0   # t_abs der Referenzuhr beim Aufnahmestart
         self._video_first_t = None
         self._video_last_t  = None
@@ -440,6 +443,7 @@ class SessionRecorder:
             self.video_consent  = bool(video_consent)
             self._participant   = probanden.analysis_view(participant)
             self._watch_arm     = watch_arm
+            self._belt_active   = vibrationsguertel.ist_verbunden()
 
             # Sitzungen liegen unter sessions/<Teilnehmer-ID>/, damit in der
             # Auswertung alle Aufnahmen einer Person beisammen liegen.
@@ -674,6 +678,9 @@ class SessionRecorder:
             # Vorzeichen von gx und gy.
             "watch_arm": self._watch_arm,
             "gravity_frame": "normiert auf linken Arm",
+            # Vibrationsgürtel beim Start der Aufzeichnung aktiv? Verbindungs-
+            # aufbau und -verlust stehen zusätzlich als Ereignis in events.csv.
+            "belt_active": self._belt_active,
             "start_time_iso": self._start_wall,
             "end_time_iso": MasterClock.iso(clock.wall_of(clock.t_abs())) if final else None,
             "duration_s": round(clock.t_abs() - self._t_offset, 3) if final else None,
@@ -996,6 +1003,45 @@ class _SpheroAPIFastClose(SpheroEduAPI):
         t = threading.Thread(target=_teardown, daemon=True)
         t.start()
         t.join(4.0)
+
+
+def aktuelle_fahrtrichtung() -> str:
+    """
+    Aktuelle Fahrtrichtung, wie sie die Steuerungsschleife gerade umsetzt.
+
+    Gedacht für Anzeigen und Zusatzgeräte (Vibrationsgürtel), die dieselbe
+    Richtung brauchen, ohne die Steuerungsschleife anzufassen. Die Funktion
+    liest nur und sendet nichts – sie ist damit gefahrlos aus fremden Threads
+    aufrufbar.
+
+    ACHTUNG: Die Reihenfolge der Abfragen bildet die Schleife in
+    control_sphero() nach (Rückwärtsfahrt hat Vorrang, danach die Prüfung auf
+    veraltete Sensordaten, dann get_state). Wird dort etwas geändert, muss es
+    hier mitgezogen werden. Der Test test_guertel.py vergleicht beide
+    Ergebnisse gegeneinander und schlägt an, wenn sie auseinanderlaufen.
+    """
+    with data_lock:
+        gx             = latest_data["gx"]
+        gy             = latest_data["gy"]
+        gz             = latest_data["gz"]
+        backward_until = latest_data["backward_until"]
+        last_update    = latest_data["last_update"]
+
+    now = time.time()
+    if now < backward_until:
+        return "backward"
+    if last_update == 0.0 or now - last_update > DATA_TIMEOUT:
+        return "neutral"
+    return get_state(gx, gy, gz)
+
+
+# Der Gürtel wird erst durch das Häkchen in der Oberfläche gestartet; bis dahin
+# existiert weder ein Thread noch eine Verbindung.
+vibrationsguertel = guertel.VibrationBelt(
+    richtung_quelle=aktuelle_fahrtrichtung,
+    on_status=lambda text: set_status(text),
+    on_event=lambda name, detail: recorder.log_event(name, detail),
+)
 
 
 def control_sphero():
@@ -2412,6 +2458,36 @@ def show_controller_ui():
               foreground="#777", wraplength=430,
               justify="left").pack(anchor="w", pady=(4, 0))
 
+    # ── Vibrationsgürtel ──────────────────────────────────────────────────────
+    # Optional. Ohne Häkchen läuft kein Thread und es wird keine Verbindung
+    # aufgebaut – der Gürtel kostet dann nichts und kann nichts stören.
+    guertel_frame = ttk.LabelFrame(main, text=" Vibrationsgürtel ", padding=8)
+    guertel_frame.pack(fill="x", pady=(10, 0))
+
+    guertel_var    = tk.BooleanVar(value=False)
+    guertel_status = tk.StringVar(value="aus")
+
+    def guertel_umschalten():
+        if guertel_var.get():
+            if vibrationsguertel.start():
+                set_status("Gürtel wird verbunden...")
+        else:
+            # Nicht auf das Trennen warten: Die Oberfläche darf dabei nicht
+            # einfrieren, falls der Gürtel gerade nicht antwortet.
+            vibrationsguertel.stop(warten=False)
+
+    ttk.Checkbutton(guertel_frame, variable=guertel_var,
+                    text="Gürtel verwenden (vibriert mit der Lenkrichtung)",
+                    command=guertel_umschalten).pack(anchor="w")
+    ttk.Label(guertel_frame, textvariable=guertel_status,
+              font=("Consolas", 9), foreground="#555",
+              wraplength=430, justify="left").pack(anchor="w", pady=(4, 0))
+    ttk.Label(guertel_frame,
+              text="rechts = Vibration rechts   ·   links = Vibration links   ·   "
+                   "rückwärts = Vibration hinten",
+              foreground="#777", wraplength=430,
+              justify="left").pack(anchor="w")
+
     recording_var = tk.StringVar(value="Keine Aufzeichnung aktiv")
     ttk.Label(main, textvariable=recording_var,
               font=("Consolas", 9), foreground="#aa0000").pack(anchor="w", pady=(4, 0))
@@ -2477,6 +2553,13 @@ def show_controller_ui():
         camera_button.config(
             text="⏹  Kamera stoppen" if cam_running else "📷  Kamera starten"
         )
+
+        # Gürtelstatus anzeigen. Ist der Gürtel-Thread beendet (Verbindung
+        # fehlgeschlagen oder verloren), das Häkchen wieder abwählen – sonst
+        # sähe es aus, als wäre der Gürtel noch aktiv.
+        guertel_status.set(vibrationsguertel.status())
+        if guertel_var.get() and not vibrationsguertel.ist_aktiv():
+            guertel_var.set(False)
 
         gw = graph_window_ref[0]
         graph_open = gw is not None and gw.win.winfo_exists()
@@ -2591,6 +2674,7 @@ def show_controller_ui():
     def on_close():
         stop_sphero_control()
         stop_camera.set()
+        vibrationsguertel.stop(warten=False)
         gw = graph_window_ref[0]
         if gw is not None and gw.win.winfo_exists():
             gw.close()
