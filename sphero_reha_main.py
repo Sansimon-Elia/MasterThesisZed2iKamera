@@ -111,6 +111,21 @@ stop_sphero    = threading.Event()
 stop_camera    = threading.Event()
 server_started = threading.Event()
 
+# ── Ausrichten der Nullrichtung ──────────────────────────────────────────────
+# Beim Ausrichten schickt die Oberfläche selbst Befehle an den Sphero. Die
+# Steuerungsschleife muss dafür stillstehen, sonst funken beide gleichzeitig auf
+# dieselbe BLE-Verbindung und der Ball zuckt zwischen Ausricht- und Fahrbefehl.
+#
+# Übergabe in zwei Schritten, damit kein Befehl der Schleife mehr unterwegs ist,
+# wenn die Oberfläche zu senden beginnt:
+#   aim_request  – von der Oberfläche gesetzt: "bitte anhalten und abgeben"
+#   aim_active   – von der Schleife gesetzt: "ich stehe, der Sphero gehört dir"
+aim_request       = threading.Event()
+aim_active        = threading.Event()
+# Nach dem Ausrichten ist die neue Nullrichtung per Definition 0°; die Schleife
+# muss ihren mitgeführten Kurs darauf zurücksetzen.
+aim_heading_reset = threading.Event()
+
 
 control_thread  = None
 server_thread   = None
@@ -183,6 +198,123 @@ GX_NEUTRAL_THRESHOLD = +0.12
 MAX_TURN_ANGLE_RIGHT = 60
 MAX_TURN_ANGLE_LEFT  = 60
 
+# ── Art der Kursführung ───────────────────────────────────────────────────────
+# "rate"     – Ratensteuerung (bisheriges und voreingestelltes Verhalten):
+#              Die Handdrehung bestimmt, wie SCHNELL sich der Kurs ändert. Der
+#              Winkel aus MAX_TURN_ANGLE_* wird pro Schleifendurchlauf
+#              aufaddiert; gehaltene Drehung heißt also dauerndes Weiterdrehen.
+#              Beliebig große Kursänderungen sind möglich, dafür muss man die
+#              Hand im richtigen Moment zurücknehmen – Überschwingen ist der
+#              typische Fehler.
+#
+# "position" – Positionssteuerung: Die Handdrehung bestimmt, WIE WEIT der Kurs
+#              vom Bezugskurs abweicht. Halbe Drehung heißt dauerhaft halber
+#              Versatz, Hand zurück heißt Kurs zurück. Der Zusammenhang ist
+#              direkt und ohne Zeitverlauf, was das Zielen erleichtert.
+#
+#              Damit trotz begrenztem Versatz beliebige Kurse erreichbar
+#              bleiben, wird der Bezugskurs bei jeder Geradeausfahrt neu
+#              gesetzt: Eine Drehung wird "eingerastet", sobald die Hand in die
+#              Neutrallage zurückkehrt, und kann von dort erneut beginnen.
+#              Ohne dieses Nachführen wäre der Sphero auf POS_MAX_OFFSET_*
+#              um die Nullrichtung eingesperrt und ließe sich nicht zurückholen.
+#
+# In der Literatur zu assistiven und teleoperierten Steuerungen ist die
+# Positionssteuerung für Ungeübte meist leichter zu dosieren und erzeugt
+# weniger Überschwingen, während die Ratensteuerung bei großen, fortlaufenden
+# Kursänderungen im Vorteil ist. Welche Art besser passt, ist damit selbst eine
+# sinnvolle Vergleichsgröße zwischen den Altersgruppen.
+STEUERMODUS_RATE     = "rate"
+STEUERMODUS_POSITION = "position"
+STEUERMODUS          = STEUERMODUS_RATE
+
+# Nur für "position": Kursversatz bei voller Handdrehung, je Seite.
+POS_MAX_OFFSET_LEFT  = 60
+POS_MAX_OFFSET_RIGHT = 60
+
+# ── Feinfühligkeit der Lenkung ────────────────────────────────────────────────
+# Exponent der Lenkkennlinie. 1.0 = linear (bisheriges Verhalten).
+#
+# Warum das nötig wurde: Die Drehrate reicht linear von 0 bis rund 600 °/s.
+# Eine Kurve um ein Objekt braucht aber nur etwa 30 bis 90 °/s. Gemessen an der
+# nutzbaren Handdrehung (gy 0,60 bis 1,00) liegt dieser ganze Bereich zwischen
+# gy 0,62 und 0,66 – also in den ersten 15 % des Wegs. Die übrigen 85 % sind
+# Drehen auf der Stelle. Kurvenfahren hieß deshalb, eine Handstellung auf wenige
+# Hundertstel genau zu halten.
+#
+# Mit einem Exponenten > 1 wird der untere Bereich gespreizt: Der Anteil geht
+# als anteil**LENK_EXPO ein, kleine Handdrehungen ergeben also deutlich kleinere
+# Drehraten, während der volle Ausschlag unverändert die Höchstrate liefert.
+# Dasselbe Mittel benutzen Fernsteuerungen im Modellbau ("Expo").
+#
+# Anhaltswerte: 2.0 verdoppelt die Feinfühligkeit im unteren Drittel spürbar,
+# 3.0 macht Kurven sehr gut dosierbar, kostet aber Reaktionsschärfe beim
+# schnellen Wenden.
+LENK_EXPO = 1.0
+
+# Kopplung der Drehrate an das Fahrtempo, 0.0 = aus (bisheriges Verhalten).
+#
+# Bisher ist die Drehrate unabhängig vom Tempo. Wer langsamer fährt, dreht sich
+# deshalb enger, wer schneller fährt, macht einen weiten Bogen – und um ein
+# Objekt herumzukommen, muss man abbremsen. Genau das ist beim Testen
+# aufgefallen.
+#
+# Bei voller Kopplung wird die Drehrate proportional zum Tempo. Eine gehaltene
+# Handstellung ergibt dann einen Kreis mit FESTEM RADIUS, unabhängig davon, wie
+# schnell gefahren wird – das Verhalten eines Lenkrads. Um ein Objekt zu fahren
+# genügt es, die Hand ruhig zu halten; Tempo und Kurve passen von selbst
+# zusammen.
+#
+# Zwischenwerte mischen beides. 0.7 lässt noch etwas Drehen im Stand zu, was
+# beim Rangieren auf engem Raum hilft.
+LENK_TEMPO_KOPPLUNG = 0.0
+
+# ── Glättung der Handhaltung ─────────────────────────────────────────────────
+# Zeitkonstante eines Tiefpasses erster Ordnung auf gx und gy. 0 schaltet die
+# Glättung ab und entspricht dem Verhalten vor dieser Änderung.
+#
+# Warum überhaupt: Die Uhr liefert die Schwerkraftrichtung roh. Darin steckt
+# neben der gewollten Handhaltung auch alles Unwillkürliche – Halte- und
+# Ruhetremor, das Zucken beim Anspannen, Erschütterungen beim Gehen. Liegt die
+# Hand nahe einer Kippschwelle, springt der Fahrzustand dadurch mehrmals pro
+# Sekunde hin und her, obwohl die Person die Hand ruhig zu halten glaubt.
+#
+# Für die Studie ist das besonders heikel: Halte- und Ruhetremor nehmen mit dem
+# Alter zu. Ungefiltert misst man in den älteren Gruppen also teilweise die
+# Empfindlichkeit der Schwellenlogik statt der Steuerleistung – genau in dem
+# Vergleich, um den es geht.
+#
+# VOREINSTELLUNG 0 = aus. Bewusst so gewählt: Das über die Testfahrten
+# eingefahrene Fahrverhalten bleibt damit die Bezugsgröße, gegen die alles
+# Neue verglichen wird. Die Glättung ist ein Angebot, das je Testperson
+# zugeschaltet und mitgespeichert wird – keine stillschweigende Änderung an
+# der Grundlage.
+#
+# Als Anhaltspunkt für das Einstellen: 0,15 s bedeutet, dass eine sprunghafte
+# Änderung der Handhaltung nach etwa einer Zeitkonstante zu 63 % übernommen
+# ist, nach drei zu 95 %. Bei rund 100 ms Zykluszeit bleibt die Steuerung damit
+# deutlich schneller als die menschliche Reaktion, während Zittern im Bereich
+# mehrerer Hertz stark gedämpft wird (gemessen: auf 22 % der Schwankungsbreite).
+GLAETTUNG_TAU_S = 0.0
+
+# ── Hysterese der Kippschwellen ──────────────────────────────────────────────
+# Zusatzweg, den die Hand zurücklegen muss, um einen Dreh- oder Fahrzustand
+# wieder zu VERLASSEN. Einschalten geschieht weiterhin genau an der Schwelle.
+#
+# Ohne diesen Zusatz gibt es je Seite nur einen einzigen Umschaltpunkt. Wer
+# knapp daran zittert, löst in schneller Folge links/neutral/links aus; der
+# Sphero ruckt, und in den Daten entstehen Dutzende Zustandswechsel, die keine
+# Absicht abbilden. Mit getrennter Ein- und Ausstiegsschwelle entsteht ein
+# Halteband (Schmitt-Trigger) – dieselbe Lösung wie in jedem Thermostat.
+#
+# VOREINSTELLUNG 0 = aus, aus demselben Grund wie bei der Glättung: Das alte
+# Fahrverhalten bleibt die Basis. Erprobte Werte zum Zuschalten sind 0,05 für
+# die Drehung und 0,03 fürs Fahren; zusammen mit einer Glättung von 0,15 s
+# sanken die Zustandswechsel bei ruhig an der Schwelle gehaltener Hand im Test
+# von 121 auf 2 in zehn Sekunden.
+GY_HYSTERESE = 0.0
+GX_HYSTERESE = 0.0
+
 # ── Reaktionsgeschwindigkeit der Steuerung ────────────────────────────────────
 # Ein Schleifendurchlauf dauert ungefähr ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP,
 # denn sphero.roll() schläft die angegebene Dauer selbst ab. Kleinere Werte
@@ -229,11 +361,19 @@ DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine
 # mit zufällig stehengebliebenen Reglern startet. "Standard" entspricht exakt
 # den oben eingetragenen Werten.
 #
-# Bewusst enthalten die Profile NUR Fahrdynamik (Tempo, Wendigkeit, Takt).
-# Die Kippschwellen GY_*_THRESHOLD und GX_* bleiben unangetastet: Sie sind die
-# Anpassung an den Bewegungsumfang der jeweiligen Person und damit unabhängig
-# davon, ob jemand langsam oder sportlich fahren möchte. Ein Profilwechsel darf
-# eine einmal eingestellte Kalibrierung nicht überschreiben.
+# Die Kippschwellen GY_*_THRESHOLD und GX_FULL_SPEED bleiben unangetastet: Sie
+# sind die Anpassung an den Bewegungsumfang der jeweiligen Person und damit
+# unabhängig davon, ob jemand langsam oder sportlich fahren möchte. Ein
+# Profilwechsel darf eine einmal eingestellte Kalibrierung nicht überschreiben.
+#
+# Alles Übrige setzen die Profile dagegen vollständig – auch Steuerungsart,
+# Glättung und Hysterese. Nur so ist "Standard" ein verlässlicher Rückweg zum
+# bekannten Ausgangsverhalten: Wer sich verstellt hat, kommt mit einem Klick
+# exakt dorthin zurück, statt einzelne Regler von Hand zurücksuchen zu müssen.
+#
+# "Standard" bildet das über die Testfahrten eingefahrene Verhalten 1:1 ab
+# (Ratensteuerung, keine Glättung, keine Hysterese) und ist damit die
+# Bezugsgröße, gegen die alles Neue verglichen wird.
 #
 # Die Zahlen sind aus Testfahrten abgeleitet und keine normierten Stufen. Für
 # die Auswertung zählt nicht der Profilname, sondern die tatsächlich gefahrene
@@ -246,13 +386,23 @@ FAHRPROFILE = {
         "MAX_TURN_ANGLE_LEFT": 40, "MAX_TURN_ANGLE_RIGHT": 40,
         "ROLL_COMMAND_DURATION": 0.08, "STOP_TIME": 0.8,
         "BACKWARD_SPEED": 50,
+        "STEUERMODUS": "rate",
+        "POS_MAX_OFFSET_LEFT": 45, "POS_MAX_OFFSET_RIGHT": 45,
+        "GLAETTUNG_TAU_S": 0.20, "GY_HYSTERESE": 0.06, "GX_HYSTERESE": 0.04,
+        "LENK_EXPO": 2.5, "LENK_TEMPO_KOPPLUNG": 0.7,
     },
+    # Entspricht exakt dem Fahrverhalten vor Einführung von Glättung,
+    # Hysterese und Positionssteuerung.
     "Standard": {
         "MIN_SPEED_DYN": 30, "MAX_SPEED_DYN": 120,
         "TURN_SPEED_FACTOR": 0.7,
         "MAX_TURN_ANGLE_LEFT": 60, "MAX_TURN_ANGLE_RIGHT": 60,
         "ROLL_COMMAND_DURATION": 0.06, "STOP_TIME": 0.6,
         "BACKWARD_SPEED": 80,
+        "STEUERMODUS": "rate",
+        "POS_MAX_OFFSET_LEFT": 60, "POS_MAX_OFFSET_RIGHT": 60,
+        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 0.0,
     },
     "Sportlich": {
         "MIN_SPEED_DYN": 45, "MAX_SPEED_DYN": 200,
@@ -260,6 +410,10 @@ FAHRPROFILE = {
         "MAX_TURN_ANGLE_LEFT": 75, "MAX_TURN_ANGLE_RIGHT": 75,
         "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.4,
         "BACKWARD_SPEED": 110,
+        "STEUERMODUS": "rate",
+        "POS_MAX_OFFSET_LEFT": 75, "POS_MAX_OFFSET_RIGHT": 75,
+        "GLAETTUNG_TAU_S": 0.05, "GY_HYSTERESE": 0.02, "GX_HYSTERESE": 0.01,
+        "LENK_EXPO": 1.8, "LENK_TEMPO_KOPPLUNG": 0.5,
     },
 }
 
@@ -292,6 +446,14 @@ def fahrverhalten_werte() -> dict:
         "STOP_TIME": STOP_TIME,
         "BACKWARD_SPEED": BACKWARD_SPEED,
         "BACKWARD_DURATION": BACKWARD_DURATION,
+        "GLAETTUNG_TAU_S": GLAETTUNG_TAU_S,
+        "GY_HYSTERESE": GY_HYSTERESE,
+        "GX_HYSTERESE": GX_HYSTERESE,
+        "STEUERMODUS": STEUERMODUS,
+        "POS_MAX_OFFSET_LEFT": POS_MAX_OFFSET_LEFT,
+        "POS_MAX_OFFSET_RIGHT": POS_MAX_OFFSET_RIGHT,
+        "LENK_EXPO": LENK_EXPO,
+        "LENK_TEMPO_KOPPLUNG": LENK_TEMPO_KOPPLUNG,
     }
 
 
@@ -312,11 +474,22 @@ FAHRWERT_GRENZEN = {
     "STOP_TIME":             (0.2, 2.0),
     "BACKWARD_SPEED":        (20, 200),
     "BACKWARD_DURATION":     (0.5, 5.0),
+    "GLAETTUNG_TAU_S":       (0.0, 0.60),
+    "GY_HYSTERESE":          (0.0, 0.15),
+    "GX_HYSTERESE":          (0.0, 0.10),
+    "POS_MAX_OFFSET_LEFT":   (10, 180),
+    "POS_MAX_OFFSET_RIGHT":  (10, 180),
+    "LENK_EXPO":             (1.0, 4.0),
+    "LENK_TEMPO_KOPPLUNG":   (0.0, 1.0),
 }
+
+# STEUERMODUS ist keine Zahl und wird deshalb getrennt geprüft.
+STEUERMODI = (STEUERMODUS_RATE, STEUERMODUS_POSITION)
 
 _FAHRWERT_GANZZAHLIG = {
     "MIN_SPEED_DYN", "MAX_SPEED_DYN", "MAX_TURN_ANGLE_LEFT",
     "MAX_TURN_ANGLE_RIGHT", "BACKWARD_SPEED",
+    "POS_MAX_OFFSET_LEFT", "POS_MAX_OFFSET_RIGHT",
 }
 
 
@@ -337,6 +510,9 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
     global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
     global STOP_TIME, BACKWARD_SPEED, BACKWARD_DURATION
+    global GLAETTUNG_TAU_S, GY_HYSTERESE, GX_HYSTERESE
+    global STEUERMODUS, POS_MAX_OFFSET_LEFT, POS_MAX_OFFSET_RIGHT
+    global LENK_EXPO, LENK_TEMPO_KOPPLUNG
     global fahrprofil_name
 
     if not isinstance(werte, dict):
@@ -374,6 +550,19 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     STOP_TIME             = round(geprueft.get("STOP_TIME", STOP_TIME), 2)
     BACKWARD_SPEED        = geprueft.get("BACKWARD_SPEED", BACKWARD_SPEED)
     BACKWARD_DURATION     = round(geprueft.get("BACKWARD_DURATION", BACKWARD_DURATION), 1)
+    GLAETTUNG_TAU_S       = round(geprueft.get("GLAETTUNG_TAU_S", GLAETTUNG_TAU_S), 2)
+    GY_HYSTERESE          = round(geprueft.get("GY_HYSTERESE", GY_HYSTERESE), 2)
+    GX_HYSTERESE          = round(geprueft.get("GX_HYSTERESE", GX_HYSTERESE), 2)
+    POS_MAX_OFFSET_LEFT   = geprueft.get("POS_MAX_OFFSET_LEFT", POS_MAX_OFFSET_LEFT)
+    POS_MAX_OFFSET_RIGHT  = geprueft.get("POS_MAX_OFFSET_RIGHT", POS_MAX_OFFSET_RIGHT)
+    LENK_EXPO             = round(geprueft.get("LENK_EXPO", LENK_EXPO), 2)
+    LENK_TEMPO_KOPPLUNG   = round(geprueft.get("LENK_TEMPO_KOPPLUNG", LENK_TEMPO_KOPPLUNG), 2)
+
+    # Unbekannte Bezeichnung übergehen statt übernehmen: Ein Tippfehler in der
+    # Datei darf nicht dazu führen, dass die Steuerung in keinem der beiden
+    # Modi läuft.
+    if werte.get("STEUERMODUS") in STEUERMODI:
+        STEUERMODUS = werte["STEUERMODUS"]
 
     if profil:
         fahrprofil_name = profil
@@ -463,11 +652,79 @@ def set_status(msg: str):
         last_status = msg
 
 
-def get_state(gx, gy, gz) -> str:
-    if gy < GY_RIGHT_THRESHOLD:   return "right"
-    if gy > GY_LEFT_THRESHOLD:    return "left"
-    if gx > GX_NEUTRAL_THRESHOLD: return "neutral"
-    if gx < GX_FORWARD_MAX:       return "forward"
+class Tiefpass:
+    """
+    Tiefpass erster Ordnung (exponentiell gleitender Mittelwert).
+
+        geglättet += alpha * (roh - geglättet)
+
+    Der Gewichtungsfaktor alpha wird aus der tatsächlich vergangenen Zeit
+    berechnet: alpha = 1 - exp(-dt / tau). Das ist wichtig, weil die Uhr ihre
+    Werte NICHT in exakt gleichen Abständen schickt – bei einem festen alpha
+    würde die Glättung mit der Übertragungsrate schwanken und wäre zwischen
+    Sitzungen nicht vergleichbar. So wirkt die Zeitkonstante tau immer gleich,
+    egal ob gerade 20 oder 60 Werte pro Sekunde ankommen.
+
+    Aussetzer werden erkannt: Nach einer längeren Lücke (Uhr kurz weg) beginnt
+    der Filter neu, statt langsam von einem veralteten Wert herzukriechen.
+    """
+
+    NEUSTART_NACH_S = 1.0
+
+    def __init__(self):
+        self._wert = None
+        self._t    = 0.0
+
+    def reset(self):
+        self._wert = None
+
+    def __call__(self, roh: float, jetzt: float, tau: float) -> float:
+        if tau <= 0.0:
+            self._wert, self._t = roh, jetzt
+            return roh
+        dt = jetzt - self._t
+        self._t = jetzt
+        if self._wert is None or dt <= 0.0 or dt > self.NEUSTART_NACH_S:
+            self._wert = roh
+            return roh
+        alpha = 1.0 - math.exp(-dt / tau)
+        self._wert += alpha * (roh - self._wert)
+        return self._wert
+
+
+# Je eine Filterinstanz für die beiden steuernden Achsen. gz wird von der
+# Steuerung nicht ausgewertet und bleibt deshalb ungefiltert.
+_filter_gx = Tiefpass()
+_filter_gy = Tiefpass()
+
+
+def get_state(gx, gy, gz, vorher: str = None) -> str:
+    """
+    Fahrzustand aus der Handhaltung.
+
+    `vorher` ist der zuletzt gültige Zustand. Ist er angegeben, gilt eine
+    Hysterese: Ein Zustand wird an seiner Schwelle betreten, aber erst wieder
+    verlassen, wenn die Hand um GY_HYSTERESE bzw. GX_HYSTERESE darüber hinaus
+    zurückgeht. Dadurch entsteht ein Halteband, in dem Zittern den Zustand nicht
+    mehr umschalten kann.
+
+    Ohne `vorher` verhält sich die Funktion wie zuvor (eine Schwelle je Seite).
+    """
+    # Beim Verlassen liegen die Schwellen um die Hysterese näher an der Mitte,
+    # sind also schwerer zu unterschreiten.
+    rechts_schwelle = GY_RIGHT_THRESHOLD + (GY_HYSTERESE if vorher == "right" else 0.0)
+    links_schwelle  = GY_LEFT_THRESHOLD  - (GY_HYSTERESE if vorher == "left"  else 0.0)
+
+    if gy < rechts_schwelle:  return "right"
+    if gy > links_schwelle:   return "left"
+
+    # Fahren/Stoppen: Der Bereich zwischen GX_FORWARD_MAX und
+    # GX_NEUTRAL_THRESHOLD war schon bisher ein Totband. Mit `vorher` wird
+    # daraus eine echte Hysterese – wer bereits fährt, darf die Hand etwas
+    # weiter anheben, ohne dass die Fahrt abreißt.
+    fahr_schwelle = GX_FORWARD_MAX + (GX_HYSTERESE if vorher == "forward" else 0.0)
+    if gx > max(GX_NEUTRAL_THRESHOLD, fahr_schwelle): return "neutral"
+    if gx < fahr_schwelle:                            return "forward"
     return "neutral"
 
 
@@ -506,10 +763,10 @@ def calc_speed(gx) -> int:
     return int(MIN_SPEED_DYN + intensity * (MAX_SPEED_DYN - MIN_SPEED_DYN))
 
 
-def calc_turn(gy_value) -> float:
+def _drehanteil(gy_value) -> float:
     """
-    Drehwinkel pro Schleifendurchlauf, 0° an der Kippschwelle bis
-    MAX_TURN_ANGLE bei voller Kippung.
+    Wie weit die Hand über die Kippschwelle hinaus gedreht ist: 0 an der
+    Schwelle, 1 bei vollem Ausschlag.
 
     Der Nullpunkt ist die Schwelle DERSELBEN Seite. Vorher stand hier eine
     gemeinsame Konstante (TURN_DEADZONE = 0.80). Solange beide Schwellen bei
@@ -517,13 +774,57 @@ def calc_turn(gy_value) -> float:
     liegt, entstünde dazwischen ein toter Bereich: Der Zustand wäre "links",
     der Drehwinkel aber 0. Der Sphero würde also in den Kurvenmodus wechseln
     (langsamer werden, Farbe umschalten), ohne sich zu drehen.
+
+    Gemeinsame Grundlage beider Steuerungsarten: Die Ratensteuerung macht daraus
+    Grad je Durchlauf, die Positionssteuerung Grad Kursversatz. Damit sich
+    beide gleich anfühlen, was das Ansprechen angeht, teilen sie diese Kennlinie.
     """
     links     = gy_value > 0
     threshold = abs(GY_LEFT_THRESHOLD) if links else abs(GY_RIGHT_THRESHOLD)
-    max_winkel = MAX_TURN_ANGLE_LEFT   if links else MAX_TURN_ANGLE_RIGHT
     span      = max(1.0 - threshold, 1e-6)
     intensity = (abs(gy_value) - threshold) / span
-    return max(0.0, min(1.0, intensity)) * max_winkel
+    anteil    = max(0.0, min(1.0, intensity))
+    # Kennlinie spreizen: Bei LENK_EXPO > 1 wirken kleine Handdrehungen
+    # deutlich schwächer, der Vollausschlag bleibt unverändert bei 1.
+    return anteil if LENK_EXPO == 1.0 else anteil ** LENK_EXPO
+
+
+def calc_turn(gy_value, tempo=None) -> float:
+    """
+    Ratensteuerung: Drehwinkel PRO SCHLEIFENDURCHLAUF, 0° an der Kippschwelle
+    bis MAX_TURN_ANGLE bei voller Kippung. Wird fortlaufend auf den Kurs
+    aufaddiert, solange die Hand gedreht bleibt.
+
+    `tempo` ist das gerade gefahrene Tempo. Es wird nur gebraucht, wenn die
+    Drehrate ans Tempo gekoppelt ist (LENK_TEMPO_KOPPLUNG > 0): Dann ergibt eine
+    gehaltene Handstellung einen Kreis mit festem Radius statt einer festen
+    Drehgeschwindigkeit. Ohne Angabe bleibt die Kopplung wirkungslos.
+    """
+    max_winkel = MAX_TURN_ANGLE_LEFT if gy_value > 0 else MAX_TURN_ANGLE_RIGHT
+    winkel     = _drehanteil(gy_value) * max_winkel
+
+    if LENK_TEMPO_KOPPLUNG > 0.0 and tempo is not None:
+        # Bezug ist das höchste in der Kurve erreichbare Tempo, damit der Faktor
+        # bei Vollgas tatsächlich 1 wird und die Kopplung die Drehrate im
+        # oberen Bereich nicht künstlich beschneidet.
+        bezug  = max(1.0, MAX_SPEED_DYN * TURN_SPEED_FACTOR)
+        anteil = max(0.0, min(1.0, float(tempo) / bezug))
+        winkel *= (1.0 - LENK_TEMPO_KOPPLUNG) + LENK_TEMPO_KOPPLUNG * anteil
+    return winkel
+
+
+def calc_kursversatz(gy_value) -> float:
+    """
+    Positionssteuerung: Kursversatz gegenüber dem Bezugskurs, mit Vorzeichen.
+
+    Positiv = nach rechts, negativ = nach links – dieselbe Zählrichtung wie beim
+    Sphero-Kurs (im Uhrzeigersinn positiv). Anders als bei calc_turn wird hier
+    NICHT aufaddiert: Der Wert ist die vollständige Abweichung, die sich aus der
+    aktuellen Handhaltung ergibt. Hand zurück heißt Kurs zurück.
+    """
+    if gy_value > 0:   # Hand nach links gedreht
+        return -_drehanteil(gy_value) * POS_MAX_OFFSET_LEFT
+    return +_drehanteil(gy_value) * POS_MAX_OFFSET_RIGHT
 
 
 def moving_average(data: list, window: int) -> np.ndarray:
@@ -671,8 +972,13 @@ SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session
 #   t_abs_s   Sekunden seit Programmstart              → gemeinsame Achse mit den Live-Graphen
 #   timestamp Wanduhrzeit ISO-8601 mit Millisekunden   → für Berichte und externe Quellen
 _CSV_SCHEMAS = {
+    # gx/gy/gz sind die unveränderten Messwerte der Uhr (auf den Tragearm
+    # normiert). gx_filt/gy_filt sind dieselben Größen nach der Glättung –
+    # also genau das, worauf die Steuerung reagiert hat. Bei abgeschalteter
+    # Glättung (GLAETTUNG_TAU_S = 0) sind beide Paare identisch.
     "sensor":       ["t_rel_s", "t_abs_s", "timestamp", "gx", "gy", "gz",
-                      "accel_x", "accel_y", "accel_z", "heart_rate", "intensity"],
+                      "accel_x", "accel_y", "accel_z", "heart_rate", "intensity",
+                      "gx_filt", "gy_filt"],
     "control":      ["t_rel_s", "t_abs_s", "timestamp", "gx", "gy", "gz",
                       "state", "heading_deg", "speed_cmd", "is_stopped"],
     # Schulterwinkel: Elevation = Hebung des Oberarms gegenüber dem Rumpf,
@@ -857,7 +1163,8 @@ class SessionRecorder:
                 f.flush()
             self._last_flush = now
 
-    def log_sensor(self, gx, gy, gz, ax, ay, az, hr, intensity):
+    def log_sensor(self, gx, gy, gz, ax, ay, az, hr, intensity,
+                   gx_filt=None, gy_filt=None):
         if not self.active:
             return
         with self._lock:
@@ -870,7 +1177,9 @@ class SessionRecorder:
             hr_out = hr if valid_hr(hr) else ""
             self._writers["sensor"].writerow(
                 [f"{t_rel:.3f}", f"{t_abs:.3f}", ts, gx, gy, gz, ax, ay, az,
-                 hr_out, intensity])
+                 hr_out, intensity,
+                 "" if gx_filt is None else f"{gx_filt:.5f}",
+                 "" if gy_filt is None else f"{gy_filt:.5f}"])
             self._counts["sensor"] += 1
             self._plot["t"].append(t_rel)
             self._plot["intensity"].append(intensity)
@@ -1045,6 +1354,18 @@ class SessionRecorder:
                 "CONTROL_LOOP_SLEEP": CONTROL_LOOP_SLEEP,
                 "BACKWARD_DURATION": BACKWARD_DURATION, "BACKWARD_SPEED": BACKWARD_SPEED,
                 "DATA_TIMEOUT": DATA_TIMEOUT,
+                # Vorverarbeitung der Handhaltung. Bei GLAETTUNG_TAU_S = 0 und
+                # beiden Hysteresen = 0 entspricht die Steuerung dem Stand vor
+                # Einführung dieser Größen.
+                "GLAETTUNG_TAU_S": GLAETTUNG_TAU_S,
+                "GY_HYSTERESE": GY_HYSTERESE, "GX_HYSTERESE": GX_HYSTERESE,
+                # "rate" = Handdrehung bestimmt die Drehgeschwindigkeit,
+                # "position" = Handdrehung bestimmt den Kursversatz.
+                "STEUERMODUS": STEUERMODUS,
+                "POS_MAX_OFFSET_LEFT": POS_MAX_OFFSET_LEFT,
+                "POS_MAX_OFFSET_RIGHT": POS_MAX_OFFSET_RIGHT,
+                "LENK_EXPO": LENK_EXPO,
+                "LENK_TEMPO_KOPPLUNG": LENK_TEMPO_KOPPLUNG,
             },
             # Die Herzfrequenzzonen sind personenabhängig und werden aus Alter
             # und (falls gemessen) Ruhepuls berechnet. Ohne diese Angaben wäre
@@ -1177,10 +1498,22 @@ def sensorlog():
     # Sphero-Steuerung (Schwerkraft). Erst auf den Tragearm normieren, danach
     # arbeiten Steuerung, Anzeige und Aufzeichnung durchgehend mit denselben
     # Bezugsachsen – unabhängig davon, an welchem Arm die Uhr sitzt.
-    gx, gy, gz = korrigiere_tragearm(float(data.get("gravityX", 0)),
-                                     float(data.get("gravityY", 0)),
-                                     float(data.get("gravityZ", 0)))
-    state = get_state(gx, gy, gz)
+    gx_roh, gy_roh, gz = korrigiere_tragearm(float(data.get("gravityX", 0)),
+                                             float(data.get("gravityY", 0)),
+                                             float(data.get("gravityZ", 0)))
+
+    # Zwei Uhren mit klarer Aufgabenteilung:
+    #   time.time()     -> Steuerung (die Schleife vergleicht damit, s.o.)
+    #   clock.t_abs()   -> Graphen und CSV (monotone Referenzuhr, siehe MasterClock)
+    t_abs = clock.t_abs()
+
+    # Glättung und Zustandsbestimmung geschehen NUR hier, an einer einzigen
+    # Stelle. Steuerungsschleife, Gürtel und Anzeige lesen das Ergebnis aus
+    # latest_data, statt es jeweils neu zu berechnen – sonst müsste dieselbe
+    # Schwellenlogik an mehreren Stellen gepflegt werden und liefe früher oder
+    # später auseinander.
+    gx = _filter_gx(gx_roh, t_abs, GLAETTUNG_TAU_S)
+    gy = _filter_gy(gy_roh, t_abs, GLAETTUNG_TAU_S)
 
     # Live-Graph (Beschleunigung + Herzfrequenz)
     ax = float(data.get("motionUserAccelerationX", 0))
@@ -1189,12 +1522,8 @@ def sensorlog():
     hr = float(data.get("heartRate", 0))
     intensity = math.sqrt(ax**2 + ay**2 + az**2)
 
-    # Zwei Uhren mit klarer Aufgabenteilung:
-    #   time.time()     -> Steuerung (die Schleife vergleicht damit, s.o.)
-    #   clock.t_abs()   -> Graphen und CSV (monotone Referenzuhr, siehe MasterClock)
-    t_abs = clock.t_abs()
-
     with data_lock:
+        state = get_state(gx, gy, gz, vorher=latest_data["state"])
         latest_data["gx"]          = gx
         latest_data["gy"]          = gy
         latest_data["gz"]          = gz
@@ -1205,7 +1534,11 @@ def sensorlog():
         heart_rate_values.append(hr)
         graph_time_values.append(t_abs)
 
-    recorder.log_sensor(gx, gy, gz, ax, ay, az, hr, intensity)
+    # Aufgezeichnet wird beides: die Rohwerte als unveränderte Messung und die
+    # geglätteten als das, worauf die Steuerung tatsächlich reagiert hat. Nur
+    # die geglätteten zu speichern hieße, die Messung durch eine Einstellung zu
+    # ersetzen – die Rohdaten wären dann unwiederbringlich weg.
+    recorder.log_sensor(gx_roh, gy_roh, gz, ax, ay, az, hr, intensity, gx, gy)
     return "OK", 200
 
 
@@ -1354,16 +1687,18 @@ def aktuelle_fahrtrichtung() -> str:
     liest nur und sendet nichts – sie ist damit gefahrlos aus fremden Threads
     aufrufbar.
 
-    ACHTUNG: Die Reihenfolge der Abfragen bildet die Schleife in
-    control_sphero() nach (Rückwärtsfahrt hat Vorrang, danach die Prüfung auf
-    veraltete Sensordaten, dann get_state). Wird dort etwas geändert, muss es
-    hier mitgezogen werden. Der Test test_guertel.py vergleicht beide
-    Ergebnisse gegeneinander und schlägt an, wenn sie auseinanderlaufen.
+    Der Fahrzustand wird NICHT neu berechnet, sondern derselbe gelesen, den
+    auch die Steuerungsschleife benutzt (beim Empfang der Sensordaten einmal
+    bestimmt, siehe sensorlog). Früher rechneten beide Seiten getrennt – mit der
+    Hysterese wäre das nicht mehr haltbar, weil jede Seite ihren eigenen
+    Vorzustand mitführte und der Gürtel dann zeitweise eine andere Richtung
+    meldete, als der Sphero tatsächlich fuhr.
+
+    Die Reihenfolge der Sonderfälle bildet weiterhin die Schleife nach:
+    Rückwärtsfahrt hat Vorrang, danach die Prüfung auf veraltete Sensordaten.
     """
     with data_lock:
-        gx             = latest_data["gx"]
-        gy             = latest_data["gy"]
-        gz             = latest_data["gz"]
+        zustand        = latest_data["state"]
         backward_until = latest_data["backward_until"]
         last_update    = latest_data["last_update"]
 
@@ -1372,7 +1707,7 @@ def aktuelle_fahrtrichtung() -> str:
         return "backward"
     if last_update == 0.0 or now - last_update > DATA_TIMEOUT:
         return "neutral"
-    return get_state(gx, gy, gz)
+    return zustand
 
 
 # Der Gürtel wird erst durch das Häkchen in der Oberfläche gestartet; bis dahin
@@ -1391,6 +1726,10 @@ def control_sphero():
     RECONNECT_DELAY  = 3.0   # Sekunden zwischen Reconnect-Versuchen
     reconnect_count  = 0
     sphero_heading   = 0     # Heading über Reconnects hinweg behalten
+    # Bezugskurs der Positionssteuerung: der Kurs, von dem aus der Versatz aus
+    # der Handhaltung gerechnet wird. Wird bei Geradeausfahrt und im Stillstand
+    # nachgeführt. In der Ratensteuerung ohne Bedeutung.
+    kurs_referenz    = 0
 
     # Ein einzelner fehlgeschlagener Befehl bedeutet nicht zwangsläufig einen
     # echten Verbindungsabbruch – z.B. kann ein Zusammenstoß (Wand, Hindernis)
@@ -1479,10 +1818,41 @@ def control_sphero():
                 reconnect_count = 0  # bei Erfolg zurücksetzen
 
                 while not stop_sphero.is_set():
+                    # ── Ausrichten: Sphero an die Oberfläche abgeben ──────────
+                    # Solange ausgerichtet wird, darf diese Schleife nichts
+                    # senden. Zwei gleichzeitige Befehlsströme auf derselben
+                    # BLE-Verbindung lassen den Ball zwischen Ausricht- und
+                    # Fahrbefehl hin- und herzucken.
+                    if aim_request.is_set():
+                        try:
+                            guard.call(sphero.stop_roll, int(sphero_heading))
+                            guard.call(sphero.set_back_led, 255)
+                        except Exception:
+                            pass
+                        is_stopped  = True
+                        current_led = None      # Farbe nach dem Ausrichten neu setzen
+                        aim_active.set()
+                        while aim_request.is_set() and not stop_sphero.is_set():
+                            time.sleep(0.05)
+                        aim_active.clear()
+                        if aim_heading_reset.is_set():
+                            aim_heading_reset.clear()
+                            # Die eben festgelegte Richtung IST jetzt 0°.
+                            sphero_heading = 0
+                            kurs_referenz  = 0
+                        try:
+                            guard.call(sphero.set_back_led, 0)
+                            guard.call(sphero.set_heading, sphero_heading)
+                        except Exception:
+                            pass
+                        last_move_time = time.time()
+                        continue
+
                     with data_lock:
                         gx             = latest_data["gx"]
                         gy             = latest_data["gy"]
                         gz             = latest_data["gz"]
+                        gemessener_zustand = latest_data["state"]
                         backward_until = latest_data["backward_until"]
                         last_update    = latest_data["last_update"]
 
@@ -1525,36 +1895,49 @@ def control_sphero():
                     # ── Ohne frische Sensordaten von Handy/Watch nichts fahren ──────
                     # (gx/gy/gz stehen sonst auf ihrem 0.0-Default, was get_state()
                     #  fälschlich als "forward" auswertet)
+                    # Der Zustand wird beim Empfang der Sensordaten EINMAL
+                    # bestimmt (mit Glättung und Hysterese, siehe sensorlog) und
+                    # hier nur noch gelesen. Früher rechnete diese Schleife ihn
+                    # neu – mit Hysterese ginge das nicht mehr auf, weil beide
+                    # Seiten unterschiedliche Vorzustände hätten und der Sphero
+                    # zeitweise anders führe, als Anzeige und Gürtel meldeten.
                     data_is_stale = (last_update == 0.0) or (time.time() - last_update > DATA_TIMEOUT)
-                    state         = "neutral" if data_is_stale else get_state(gx, gy, gz)
+                    state         = "neutral" if data_is_stale else gemessener_zustand
                     applied_speed = 0
 
                     try:
-                        if state == "right":
-                            turn           = calc_turn(gy)
-                            applied_speed  = int(calc_speed(gx) * TURN_SPEED_FACTOR)
-                            sphero_heading = (sphero_heading + turn) % 360
+                        if state in ("right", "left"):
+                            applied_speed = int(calc_speed(gx) * TURN_SPEED_FACTOR)
+                            if STEUERMODUS == STEUERMODUS_POSITION:
+                                # Kurs = Bezugskurs + Versatz aus der Handhaltung.
+                                # Nichts wird aufaddiert: Dieselbe Handhaltung
+                                # ergibt immer denselben Kurs, Hand zurück heißt
+                                # Kurs zurück.
+                                sphero_heading = (kurs_referenz
+                                                  + calc_kursversatz(gy)) % 360
+                            else:
+                                # Ratensteuerung: Winkel je Durchlauf aufaddieren.
+                                # Tempo mitgeben, damit die Kurve bei aktiver
+                                # Kopplung ihren Radius behält, statt bei
+                                # langsamer Fahrt enger zu werden.
+                                turn = calc_turn(gy, tempo=applied_speed)
+                                sphero_heading = (sphero_heading
+                                                  + (turn if state == "right" else -turn)) % 360
                             guard.call(sphero.roll, int(sphero_heading), applied_speed,
                                        ROLL_COMMAND_DURATION)
-                            set_led(255, 100, 0)
-                            last_move_time = time.time()
-                            is_stopped     = False
-                            with data_lock:
-                                latest_data["heading"] = sphero_heading
-
-                        elif state == "left":
-                            turn           = calc_turn(gy)
-                            applied_speed  = int(calc_speed(gx) * TURN_SPEED_FACTOR)
-                            sphero_heading = (sphero_heading - turn) % 360
-                            guard.call(sphero.roll, int(sphero_heading), applied_speed,
-                                       ROLL_COMMAND_DURATION)
-                            set_led(0, 200, 255)
+                            set_led(*((255, 100, 0) if state == "right" else (0, 200, 255)))
                             last_move_time = time.time()
                             is_stopped     = False
                             with data_lock:
                                 latest_data["heading"] = sphero_heading
 
                         elif state == "forward":
+                            # Geradeausfahrt rastet den erreichten Kurs ein: Er
+                            # wird zum neuen Bezug für die nächste Drehung. Ohne
+                            # dieses Nachführen bliebe die Positionssteuerung auf
+                            # POS_MAX_OFFSET_* um die Nullrichtung eingesperrt,
+                            # und der Sphero ließe sich nicht zurückholen.
+                            kurs_referenz = sphero_heading
                             applied_speed = calc_speed(gx)
                             guard.call(sphero.roll, int(sphero_heading), applied_speed,
                                        ROLL_COMMAND_DURATION)
@@ -1563,6 +1946,10 @@ def control_sphero():
                             is_stopped     = False
 
                         elif state == "neutral":
+                            # Auch das Anhalten rastet den Kurs ein, damit die
+                            # nächste Drehung von der tatsächlichen Blickrichtung
+                            # aus beginnt und nicht von einem alten Bezug.
+                            kurs_referenz = sphero_heading
                             if not is_stopped and time.time() - last_move_time > STOP_TIME:
                                 guard.call(sphero.stop_roll, int(sphero_heading))
                                 is_stopped = True
@@ -2393,6 +2780,158 @@ class LiveGraphWindow:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Nullrichtung ausrichten
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AusrichtFenster:
+    """
+    Legt fest, welche Richtung für den Sphero "vorwärts" bedeutet.
+
+    Das Problem: Der Sphero kennt keine Weltrichtung, sondern nur seine eigene
+    Nullrichtung. Die entsteht beim Verbinden aus der zufälligen Lage des Balls.
+    Zeigt sie nicht zur steuernden Person, fährt er bei "vorwärts" schräg an ihr
+    vorbei, und links/rechts stimmen nicht mit dem überein, was sie sieht.
+
+    Warum das für die Studie zählt: Ohne festen Ausrichtschritt fährt jede
+    Testperson eine geringfügig andere Zuordnung zwischen Handbewegung und
+    beobachteter Fahrtrichtung – ein Störfaktor, der sich über die ganze
+    Erhebung zieht und die Gruppen unvergleichbar macht.
+
+    Bedienung wie in den offiziellen Sphero-Apps: Die blaue Rückleuchte wird
+    eingeschaltet, der Ball per Tastendruck auf der Stelle gedreht, bis die
+    Leuchte zur Person zeigt. Danach wird diese Richtung als 0° übernommen.
+
+    Technisch wird nicht gefahren, sondern nur der Kurs gesetzt: Bei Tempo 0
+    dreht sich der Ball an Ort und Stelle. Am Ende macht reset_aim() die
+    aktuelle Blickrichtung zur neuen Null.
+    """
+
+    SCHRITTE   = (-45, -15, -5, 5, 15, 45)
+    UEBERGABE_TIMEOUT_S = 3.0
+
+    def __init__(self, parent):
+        self.win = tk.Toplevel(parent)
+        self.win.title("Sphero ausrichten")
+        self.win.geometry("560x430")
+        self.win.transient(parent)
+
+        self._winkel     = 0      # bisher aufsummierte Drehung
+        self._uebernommen = False
+
+        rahmen = ttk.Frame(self.win, padding=16)
+        rahmen.pack(fill="both", expand=True)
+
+        ttk.Label(rahmen, text="Sphero ausrichten",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(rahmen,
+                  text="Der Sphero dreht sich auf der Stelle. Drehen Sie ihn so, dass die "
+                       "blaue Rückleuchte zur steuernden Person zeigt – diese Richtung "
+                       "wird dann zu „vorwärts“.\n\n"
+                       "Solange dieses Fenster offen ist, reagiert der Sphero nicht auf "
+                       "die Uhr.",
+                  foreground="#555", wraplength=500,
+                  justify="left").pack(anchor="w", pady=(6, 12))
+
+        self.status_var = tk.StringVar(value="Verbinde mit dem Sphero...")
+        ttk.Label(rahmen, textvariable=self.status_var, wraplength=500,
+                  justify="left").pack(anchor="w")
+
+        self.winkel_var = tk.StringVar(value="Drehung: 0°")
+        ttk.Label(rahmen, textvariable=self.winkel_var,
+                  font=("Consolas", 20, "bold"),
+                  foreground="#06c").pack(anchor="w", pady=(10, 10))
+
+        # Tasten in der Reihenfolge, wie sich der Ball dreht: links herum links.
+        tasten = ttk.Frame(rahmen)
+        tasten.pack(fill="x")
+        self._tasten = []
+        for schritt in self.SCHRITTE:
+            pfeil = "↺" if schritt < 0 else "↻"
+            b = ttk.Button(tasten, text=f"{pfeil} {abs(schritt)}°",
+                           width=8, command=lambda s=schritt: self._drehe(s))
+            b.pack(side="left", padx=(0, 6))
+            self._tasten.append(b)
+
+        ttk.Label(rahmen,
+                  text="↺ dreht gegen den Uhrzeigersinn, ↻ im Uhrzeigersinn "
+                       "(von oben betrachtet).",
+                  foreground="#777", wraplength=500,
+                  justify="left").pack(anchor="w", pady=(8, 0))
+
+        knoepfe = ttk.Frame(rahmen)
+        knoepfe.pack(fill="x", side="bottom", pady=(16, 0))
+        self.ok_button = ttk.Button(knoepfe, text="✔  Diese Richtung ist vorwärts",
+                                    command=self._uebernehmen)
+        self.ok_button.pack(side="left")
+        ttk.Button(knoepfe, text="Abbrechen",
+                   command=self.close).pack(side="right")
+
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.win.after(50, self._uebernahme_anfordern)
+
+    # ── Übergabe der Verbindung ───────────────────────────────────────────────
+
+    def _uebernahme_anfordern(self):
+        """Steuerungsschleife anhalten und warten, bis sie den Sphero freigibt."""
+        if sphero_api is None:
+            self._sperren("Der Sphero ist nicht verbunden. Bitte zuerst "
+                          "„Sphero starten“ drücken.")
+            return
+        aim_request.set()
+        if not aim_active.wait(self.UEBERGABE_TIMEOUT_S):
+            aim_request.clear()
+            self._sperren("Die Steuerung hat den Sphero nicht freigegeben. "
+                          "Bitte erneut versuchen.")
+            return
+        self.status_var.set("Bereit. Die blaue Rückleuchte leuchtet.")
+        recorder.log_event("ausrichten_start", "")
+
+    def _sperren(self, text):
+        self.status_var.set(text)
+        for b in self._tasten:
+            b.config(state="disabled")
+        self.ok_button.config(state="disabled")
+
+    # ── Drehen ────────────────────────────────────────────────────────────────
+
+    def _drehe(self, schritt: int):
+        if sphero_api is None or not aim_active.is_set():
+            return
+        self._winkel = (self._winkel + schritt) % 360
+        try:
+            # Tempo ist 0, deshalb dreht sich der Ball nur, statt zu fahren.
+            sphero_api.set_heading(self._winkel)
+        except Exception as e:
+            self.status_var.set(f"Befehl fehlgeschlagen: {type(e).__name__}")
+            return
+        self.winkel_var.set(f"Drehung: {self._winkel}°")
+
+    def _uebernehmen(self):
+        if sphero_api is None or not aim_active.is_set():
+            return
+        try:
+            # Macht die aktuelle Blickrichtung zur neuen Null. Danach ist der
+            # mitgeführte Kurs der Steuerung ebenfalls 0 (aim_heading_reset).
+            sphero_api.reset_aim()
+            sphero_api.set_heading(0)
+        except Exception as e:
+            self.status_var.set(f"Übernehmen fehlgeschlagen: {type(e).__name__}")
+            return
+        self._uebernommen = True
+        recorder.log_event("ausrichten_uebernommen", f"Drehung {self._winkel} Grad")
+        set_status("Nullrichtung übernommen – „vorwärts“ zeigt jetzt zur Person.")
+        self.close()
+
+    def close(self):
+        if aim_active.is_set() and not self._uebernommen:
+            recorder.log_event("ausrichten_abgebrochen", f"Drehung {self._winkel} Grad")
+        if self._uebernommen:
+            aim_heading_reset.set()
+        aim_request.clear()
+        self.win.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Ruhepuls messen
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2672,6 +3211,14 @@ class DrivingTuneWindow:
         self.var_stoppzeit  = tk.DoubleVar(value=float(STOP_TIME))
         self.var_rueck_v    = tk.DoubleVar(value=float(BACKWARD_SPEED))
         self.var_rueck_t    = tk.DoubleVar(value=float(BACKWARD_DURATION))
+        self.var_glaettung  = tk.DoubleVar(value=float(GLAETTUNG_TAU_S))
+        self.var_hyst_gy    = tk.DoubleVar(value=float(GY_HYSTERESE))
+        self.var_hyst_gx    = tk.DoubleVar(value=float(GX_HYSTERESE))
+        self.var_modus      = tk.StringVar(value=STEUERMODUS)
+        self.var_pos_l      = tk.DoubleVar(value=float(POS_MAX_OFFSET_LEFT))
+        self.var_pos_r      = tk.DoubleVar(value=float(POS_MAX_OFFSET_RIGHT))
+        self.var_expo       = tk.DoubleVar(value=float(LENK_EXPO))
+        self.var_kopplung   = tk.DoubleVar(value=float(LENK_TEMPO_KOPPLUNG))
 
         # ── Fahrprofile ───────────────────────────────────────────────────────
         self._abschnitt(main, "Fahrprofil")
@@ -2693,61 +3240,197 @@ class DrivingTuneWindow:
         ttk.Label(main, textvariable=self.profil_var, foreground="#06c",
                   font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 0))
 
+        # ── Art der Kursführung ───────────────────────────────────────────────
+        self._abschnitt(main, "Art der Lenkung")
+        ttk.Radiobutton(
+            main, variable=self.var_modus, value=STEUERMODUS_RATE,
+            text="Ratensteuerung – gehaltene Drehung dreht ihn immer weiter",
+            command=lambda: self._uebernehmen()).pack(anchor="w")
+        ttk.Label(main,
+                  text="Bisheriges Verhalten. Beliebig grosse Kurven moeglich, "
+                       "man muss die Hand aber im richtigen Moment zurueckdrehen.",
+                  foreground="#777", wraplength=540,
+                  justify="left").pack(anchor="w", padx=(22, 0), pady=(0, 6))
+        ttk.Radiobutton(
+            main, variable=self.var_modus, value=STEUERMODUS_POSITION,
+            text="Positionssteuerung – die Handhaltung bestimmt den Kurs direkt",
+            command=lambda: self._uebernehmen()).pack(anchor="w")
+        ttk.Label(main,
+                  text="Halbe Drehung = dauerhaft halber Kursversatz, Hand zurueck "
+                       "= Kurs zurueck. Leichter zu dosieren, weniger Ueberschwingen. "
+                       "Bei Geradeausfahrt rastet der erreichte Kurs ein, sodass "
+                       "trotzdem jede Richtung erreichbar bleibt.",
+                  foreground="#777", wraplength=540,
+                  justify="left").pack(anchor="w", padx=(22, 0), pady=(0, 2))
+
         self._abschnitt(main, "1  Tempo geradeaus")
         self._regler(main, "Grundtempo", self.var_tempo_min, 0, 150, 1,
-                     "hoeher = er rollt schon bei leichter Handneigung zuegig los",
-                     "tiefer = die Fahrt beginnt ganz sachte (leichter zu "
-                     "kontrollieren, gut fuer den ersten Versuch)")
+                     "hoeher = er rollt sofort zuegig los, kein sachtes Anfahren mehr",
+                     "tiefer = die Fahrt beginnt ganz langsam und ist leichter zu "
+                     "kontrollieren (gut fuer den ersten Versuch)",
+                     was="Tempo in dem Moment, in dem er losfaehrt – also bei gerade "
+                         "eben gesenkter Hand. Skala 0 bis 255.")
         self._regler(main, "Hoechsttempo", self.var_tempo_max, 20, self.SPEED_MAX, 5,
                      "hoeher = bei voll gesenkter Hand faehrt er deutlich schneller "
                      "(fuer sportliche Testpersonen)",
                      "tiefer = das Tempo bleibt insgesamt gedaempft, mehr Zeit zum "
-                     "Reagieren")
+                     "Reagieren",
+                     was="Tempo bei voll gesenkter Hand. Zwischen Grundtempo und "
+                         "Hoechsttempo steigt es gleichmaessig mit der Handneigung. "
+                         "255 ist die Grenze des Sphero.")
         self._regler(main, "Neigung fuer Vollgas", self.var_vollgas, 0.30, 0.95, 0.05,
-                     "hoeher = das Hoechsttempo verlangt eine weit gesenkte Hand "
-                     "(feinere Dosierung ueber den ganzen Weg)",
-                     "tiefer = das Hoechsttempo ist schon bei wenig Neigung erreicht "
-                     "(fuer eingeschraenkte Beweglichkeit)")
+                     "hoeher = Vollgas erst bei weit gesenkter Hand; der ganze "
+                     "Bewegungsweg steht zum Dosieren zur Verfuegung",
+                     "tiefer = Vollgas schon bei wenig Neigung; hilft bei "
+                     "eingeschraenkter Beweglichkeit, ist dafuer grober dosierbar",
+                     was="Wie weit die Hand gesenkt sein muss, damit das Hoechsttempo "
+                         "anliegt. 0.95 ist fast senkrecht nach unten.")
 
         self._abschnitt(main, "2  Linkskurve")
         self._regler(main, "Schwelle links", self.var_schwelle_l, 0.40, 0.95, 0.01,
-                     "hoeher = Hand muss weiter gedreht werden, bevor die Kurve beginnt",
-                     "tiefer = Kurve beginnt schon bei leichter Drehung (leichter, "
-                     "aber auch schneller versehentlich)")
+                     "hoeher = die Hand muss weiter gedreht werden, bevor er ueberhaupt "
+                     "lenkt; versehentliches Lenken wird seltener",
+                     "tiefer = er lenkt schon bei leichter Drehung; leichter erreichbar, "
+                     "aber auch schneller ungewollt ausgeloest",
+                     was="Ab welcher Handdrehung die Linkskurve beginnt. Darunter faehrt "
+                         "er geradeaus. 1.00 waere die Hand komplett auf der Seite.")
         self._regler(main, "Max. Winkel links", self.var_winkel_l, 10, 90, 1,
-                     "hoeher = bei voller Handdrehung dreht er schaerfer/enger",
-                     "tiefer = die Kurve wird weiter und sanfter")
+                     "hoeher = er dreht sich bei voller Handdrehung sehr schnell; gut "
+                     "zum Wenden, aber schwerer fein zu dosieren",
+                     "tiefer = er dreht insgesamt gemaechlicher; Kurven lassen sich "
+                     "deutlich genauer treffen",
+                     was="Hoechste Drehgeschwindigkeit, erreicht bei voller Handdrehung. "
+                         "Angabe in Grad je Lenkschritt; bei 100 ms Takt entsprechen "
+                         "30 Grad rund 300 Grad je Sekunde.")
 
         self._abschnitt(main, "3  Rechtskurve")
         self._regler(main, "Schwelle rechts", self.var_schwelle_r, 0.40, 0.95, 0.01,
-                     "hoeher = Hand muss weiter gedreht werden, bevor die Kurve beginnt",
-                     "tiefer = Kurve beginnt schon bei leichter Drehung")
+                     "hoeher = die Hand muss weiter gedreht werden, bevor er ueberhaupt "
+                     "lenkt; versehentliches Lenken wird seltener",
+                     "tiefer = er lenkt schon bei leichter Drehung; leichter erreichbar, "
+                     "aber auch schneller ungewollt ausgeloest",
+                     was="Ab welcher Handdrehung die Rechtskurve beginnt. Darf sich von "
+                         "der linken Schwelle unterscheiden – die Drehung faellt in eine "
+                         "Richtung anatomisch schwerer.")
         self._regler(main, "Max. Winkel rechts", self.var_winkel_r, 10, 90, 1,
-                     "hoeher = bei voller Handdrehung dreht er schaerfer/enger",
-                     "tiefer = die Kurve wird weiter und sanfter")
+                     "hoeher = er dreht sich bei voller Handdrehung sehr schnell; gut "
+                     "zum Wenden, aber schwerer fein zu dosieren",
+                     "tiefer = er dreht insgesamt gemaechlicher; Kurven lassen sich "
+                     "deutlich genauer treffen",
+                     was="Hoechste Drehgeschwindigkeit nach rechts, erreicht bei voller "
+                         "Handdrehung. Gleiche Einheit wie links.")
+
+        self._abschnitt(main, "3b  Nur bei Positionssteuerung")
+        ttk.Label(main,
+                  text="Wie weit der Kurs bei voller Handdrehung vom Bezugskurs "
+                       "abweicht. In der Ratensteuerung ohne Wirkung.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        self._regler(main, "Kursversatz links", self.var_pos_l, 10, 180, 5,
+                     "hoeher = volle Handdrehung schwenkt ihn weiter herum; eine "
+                     "Rechtwinkelkurve gelingt in einem Zug",
+                     "tiefer = kleinere Schwenks je Zug, dafuer feiner dosierbar",
+                     was="Nur bei Positionssteuerung: um wie viel Grad der Kurs bei "
+                         "voller Handdrehung nach links abweicht.")
+        self._regler(main, "Kursversatz rechts", self.var_pos_r, 10, 180, 5,
+                     "hoeher = volle Handdrehung schwenkt ihn weiter herum; eine "
+                     "Rechtwinkelkurve gelingt in einem Zug",
+                     "tiefer = kleinere Schwenks je Zug, dafuer feiner dosierbar",
+                     was="Nur bei Positionssteuerung: dasselbe fuer die rechte Seite.")
+
+        self._abschnitt(main, "3c  Kurven fahren")
+        ttk.Label(main,
+                  text="Diese beiden Regler entscheiden, wie gut sich eine Kurve um ein "
+                       "Objekt dosieren laesst. Auf 1.0 und 0.00 gestellt ergibt sich "
+                       "das Verhalten von vorher.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        self._regler(main, "Feinfuehligkeit (Expo)", self.var_expo, 1.0, 4.0, 0.1,
+                     "hoeher = der untere Teil des Handwegs dreht viel langsamer, "
+                     "Kurven lassen sich genau dosieren; der Vollausschlag dreht "
+                     "unveraendert schnell",
+                     "tiefer = gleichmaessige Verteilung; die ganze Kurvendosierung "
+                     "draengt sich in die ersten Hundertstel der Handdrehung (1.0 = aus)",
+                     was="Verteilt die Drehgeschwindigkeit ueber den Handweg um. Bei 1.0 "
+                         "ergibt halbe Handdrehung halbe Drehgeschwindigkeit, bei 2.0 nur "
+                         "noch ein Viertel davon. KEINE Verzoegerung – der Sphero "
+                         "reagiert genauso schnell wie vorher, nur mit anderer "
+                         "Uebersetzung.")
+        self._regler(main, "Kurve an Tempo koppeln", self.var_kopplung, 0.0, 1.0, 0.05,
+                     "hoeher = gehaltene Hand ergibt einen Kreis mit gleichbleibendem "
+                     "Radius wie bei einem Lenkrad; zum Kurvenfahren muss nicht mehr "
+                     "abgebremst werden",
+                     "tiefer = Drehgeschwindigkeit unabhaengig vom Tempo: langsame Fahrt "
+                     "dreht eng, schnelle Fahrt macht weite Boegen (0 = aus)",
+                     was="Wie stark die Drehgeschwindigkeit dem Fahrtempo folgt. Bei 1.00 "
+                         "drehen sich Tempo und Kurve immer im gleichen Verhaeltnis, "
+                         "der Kurvenradius bleibt also konstant.")
 
         self._abschnitt(main, "4  Gilt fuer beide Seiten")
         self._regler(main, "Kurven-Tempo", self.var_tempo, 0.20, 1.00, 0.05,
-                     "hoeher = er faehrt in der Kurve schneller -> weiter Bogen",
-                     "tiefer = er wird in der Kurve langsamer -> dreht enger, "
-                     "fast auf der Stelle")
+                     "hoeher = er bleibt in der Kurve schnell und faehrt einen weiten "
+                     "Bogen",
+                     "tiefer = er wird in der Kurve deutlich langsamer und dreht eng, "
+                     "fast auf der Stelle",
+                     was="Anteil des normalen Tempos, den er waehrend einer Kurve noch "
+                         "faehrt. 0.70 heisst: in der Kurve 70 Prozent des Tempos, das "
+                         "die Handneigung sonst ergaebe.")
         self._regler(main, "Zykluszeit (s)", self.var_zyklus, 0.04, 0.15, 0.01,
-                     "hoeher = seltener gelenkt: dreht langsamer, reagiert traeger, "
-                     "schont die Funkverbindung",
-                     "tiefer = oefter gelenkt: dreht schneller, reagiert direkter, "
-                     "mehr Funklast (Abrissgefahr)")
+                     "hoeher = seltener gelenkt: er dreht langsamer und reagiert "
+                     "traeger, dafuer wird die Funkverbindung geschont",
+                     "tiefer = oefter gelenkt: er dreht schneller und reagiert direkter, "
+                     "belastet aber die Funkverbindung (Abrissgefahr)",
+                     was="Abstand zwischen zwei Lenkbefehlen. Wirkt doppelt: Er bestimmt "
+                         "die Reaktionszeit UND – weil der Drehwinkel je Befehl gilt – "
+                         "die tatsaechliche Drehgeschwindigkeit.")
 
         self._abschnitt(main, "5  Anhalten und Rueckwaerts")
         self._regler(main, "Nachlauf bis Stopp (s)", self.var_stoppzeit, 0.2, 2.0, 0.1,
-                     "hoeher = kurzes Zurueckziehen der Hand stoppt ihn nicht sofort "
-                     "(verzeiht Zittern und kurze Pausen)",
-                     "tiefer = er bleibt sofort stehen, sobald die Hand zurueckgeht")
+                     "hoeher = kurzes Zurueckziehen der Hand stoppt ihn nicht sofort; "
+                     "verzeiht Zittern und kurze Pausen",
+                     "tiefer = er bleibt sofort stehen, sobald die Hand zurueckgeht",
+                     was="Wie lange die Hand in Neutralstellung sein muss, bevor der "
+                         "Stopp-Befehl geht.")
         self._regler(main, "Rueckwaerts-Tempo", self.var_rueck_v, 20, 200, 5,
                      "hoeher = die Rueckwaertsfahrt nach Doppeltipp ist zuegiger",
-                     "tiefer = er setzt langsam und kontrolliert zurueck")
+                     "tiefer = er setzt langsam und kontrolliert zurueck",
+                     was="Festes Tempo waehrend der Rueckwaertsfahrt. Haengt nicht an "
+                         "der Handneigung – die Rueckwaertsfahrt laeuft von selbst ab.")
         self._regler(main, "Rueckwaerts-Dauer (s)", self.var_rueck_t, 0.5, 5.0, 0.5,
                      "hoeher = ein Doppeltipp bringt ihn weiter zurueck",
-                     "tiefer = kurzes Zuruecksetzen, dann wieder normale Steuerung")
+                     "tiefer = kurzes Zuruecksetzen, dann wieder normale Steuerung",
+                     was="Wie lange ein Doppeltipp auf die Uhr rueckwaerts fahren laesst. "
+                         "Waehrend dieser Zeit ist die Handsteuerung ausgesetzt.")
+
+        self._abschnitt(main, "6  Ruhige Hand (Zittern ausgleichen)")
+        ttk.Label(main,
+                  text="Die Uhr misst auch unwillkuerliches Zittern mit. Diese drei "
+                       "Regler entscheiden, wie stark es die Steuerung erreicht. "
+                       "Alle auf 0 gestellt ergibt das Verhalten von vorher.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        self._regler(main, "Glaettung (s)", self.var_glaettung, 0.0, 0.60, 0.05,
+                     "hoeher = Zittern wird stark gedaempft, die Steuerung folgt der "
+                     "Hand dafuer merklich verzoegert",
+                     "tiefer = folgt der Hand unmittelbar, uebernimmt aber auch jedes "
+                     "Zucken (0 = aus)",
+                     was="Als einziger Regler eine ZEIT: Wie traege die Steuerung der "
+                         "Hand folgt. Bei 0.15 s ist eine ruckartige Handbewegung nach "
+                         "0,15 Sekunden zu knapp zwei Dritteln uebernommen.")
+        self._regler(main, "Halteband Drehung", self.var_hyst_gy, 0.0, 0.15, 0.01,
+                     "hoeher = eine begonnene Kurve bleibt bestehen, bis die Hand "
+                     "deutlich zurueckgedreht wird; kein Flattern an der Schwelle",
+                     "tiefer = die Kurve endet genau an der Schwelle, dafuer kann "
+                     "Zittern dort staendig ein- und ausschalten (0 = aus)",
+                     was="Wie weit die Hand ueber die Schwelle ZURUECK muss, um eine "
+                         "begonnene Kurve wieder zu beenden. Angefangen wird weiterhin "
+                         "genau an der Schwelle – wie bei einem Thermostat.")
+        self._regler(main, "Halteband Fahren", self.var_hyst_gx, 0.0, 0.10, 0.01,
+                     "hoeher = die Fahrt reisst nicht ab, wenn die Hand kurz etwas "
+                     "hochgeht",
+                     "tiefer = er haelt genau an der Schwelle an (0 = aus)",
+                     was="Dasselbe fuer Fahren und Anhalten: wie weit die Hand ueber die "
+                         "Fahrschwelle zurueck muss, damit die Fahrt endet.")
 
         # ── Live-Anzeige ──────────────────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(12, 8))
@@ -2804,14 +3487,31 @@ class DrivingTuneWindow:
         ttk.Label(parent, text=titel,
                   font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 2))
 
-    def _regler(self, parent, titel, variable, von, bis, schritt, hoch, tief):
+    def _regler(self, parent, titel, variable, von, bis, schritt, hoch, tief,
+                was=""):
+        """
+        Ein Schieberegler mit dreiteiliger Erklärung.
+
+        `was`  – was der Wert überhaupt bedeutet, neutral und mit Einheit
+        `hoch` – was ein höherer Wert im Fahren bewirkt
+        `tief` – was ein niedrigerer Wert bewirkt
+
+        Die neutrale Zeile ist wichtig: Aus "höher/tiefer" allein geht nicht
+        hervor, WAS da eigentlich verstellt wird. Wer das Fenster zum ersten Mal
+        öffnet, soll jeden Regler verstehen, ohne im Quelltext nachsehen zu
+        müssen.
+        """
         rahmen = ttk.Frame(parent)
-        rahmen.pack(fill="x", pady=(4, 0))
+        rahmen.pack(fill="x", pady=(6, 0))
         kopf = ttk.Frame(rahmen)
         kopf.pack(fill="x")
         ttk.Label(kopf, text=titel, font=("Segoe UI", 10, "bold")).pack(side="left")
         wert = ttk.Label(kopf, text="", font=("Consolas", 11), foreground="#06c")
         wert.pack(side="right")
+
+        if was:
+            ttk.Label(rahmen, text=was, foreground="#333",
+                      wraplength=560, justify="left").pack(anchor="w", pady=(1, 2))
 
         tk.Scale(rahmen, from_=von, to=bis, resolution=schritt,
                  orient="horizontal", variable=variable, showvalue=False,
@@ -2860,6 +3560,9 @@ class DrivingTuneWindow:
         global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
         global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
         global STOP_TIME, BACKWARD_SPEED, BACKWARD_DURATION
+        global GLAETTUNG_TAU_S, GY_HYSTERESE, GX_HYSTERESE
+        global STEUERMODUS, POS_MAX_OFFSET_LEFT, POS_MAX_OFFSET_RIGHT
+        global LENK_EXPO, LENK_TEMPO_KOPPLUNG
         global fahrprofil_name
 
         MIN_SPEED_DYN = int(round(float(self.var_tempo_min.get())))
@@ -2884,6 +3587,15 @@ class DrivingTuneWindow:
         STOP_TIME             = round(float(self.var_stoppzeit.get()), 2)
         BACKWARD_SPEED        = int(round(float(self.var_rueck_v.get())))
         BACKWARD_DURATION     = round(float(self.var_rueck_t.get()), 1)
+        GLAETTUNG_TAU_S       = round(float(self.var_glaettung.get()), 2)
+        GY_HYSTERESE          = round(float(self.var_hyst_gy.get()), 2)
+        GX_HYSTERESE          = round(float(self.var_hyst_gx.get()), 2)
+        POS_MAX_OFFSET_LEFT   = int(round(float(self.var_pos_l.get())))
+        POS_MAX_OFFSET_RIGHT  = int(round(float(self.var_pos_r.get())))
+        LENK_EXPO             = round(float(self.var_expo.get()), 2)
+        LENK_TEMPO_KOPPLUNG   = round(float(self.var_kopplung.get()), 2)
+        if self.var_modus.get() in STEUERMODI:
+            STEUERMODUS = self.var_modus.get()
 
         fahrprofil_name = profil
         self.profil_var.set(
@@ -2907,6 +3619,14 @@ class DrivingTuneWindow:
         self.var_zyklus.set(werte["ROLL_COMMAND_DURATION"])
         self.var_stoppzeit.set(werte["STOP_TIME"])
         self.var_rueck_v.set(werte["BACKWARD_SPEED"])
+        self.var_glaettung.set(werte["GLAETTUNG_TAU_S"])
+        self.var_hyst_gy.set(werte["GY_HYSTERESE"])
+        self.var_hyst_gx.set(werte["GX_HYSTERESE"])
+        self.var_pos_l.set(werte["POS_MAX_OFFSET_LEFT"])
+        self.var_pos_r.set(werte["POS_MAX_OFFSET_RIGHT"])
+        self.var_expo.set(werte["LENK_EXPO"])
+        self.var_kopplung.set(werte["LENK_TEMPO_KOPPLUNG"])
+        self.var_modus.set(werte["STEUERMODUS"])
         self._uebernehmen(profil=name)
         set_status(f"Fahrprofil „{name}“ übernommen.")
 
@@ -2964,6 +3684,14 @@ class DrivingTuneWindow:
             self.var_stoppzeit.set(STOP_TIME)
             self.var_rueck_v.set(BACKWARD_SPEED)
             self.var_rueck_t.set(BACKWARD_DURATION)
+            self.var_glaettung.set(GLAETTUNG_TAU_S)
+            self.var_hyst_gy.set(GY_HYSTERESE)
+            self.var_hyst_gx.set(GX_HYSTERESE)
+            self.var_pos_l.set(POS_MAX_OFFSET_LEFT)
+            self.var_pos_r.set(POS_MAX_OFFSET_RIGHT)
+            self.var_expo.set(LENK_EXPO)
+            self.var_kopplung.set(LENK_TEMPO_KOPPLUNG)
+            self.var_modus.set(STEUERMODUS)
             self.profil_var.set(
                 "aktuell: von Hand eingestellt" if fahrprofil_name == PROFIL_MANUELL
                 else f"aktuell: Profil {fahrprofil_name}")
@@ -2996,7 +3724,15 @@ class DrivingTuneWindow:
                 f"ROLL_COMMAND_DURATION = {ROLL_COMMAND_DURATION}\n"
                 f"STOP_TIME             = {STOP_TIME}\n"
                 f"BACKWARD_SPEED        = {BACKWARD_SPEED}\n"
-                f"BACKWARD_DURATION     = {BACKWARD_DURATION}")
+                f"BACKWARD_DURATION     = {BACKWARD_DURATION}\n"
+                f"GLAETTUNG_TAU_S       = {GLAETTUNG_TAU_S}\n"
+                f"GY_HYSTERESE          = {GY_HYSTERESE}\n"
+                f"GX_HYSTERESE          = {GX_HYSTERESE}\n"
+                f"STEUERMODUS           = {STEUERMODUS!r}\n"
+                f"POS_MAX_OFFSET_LEFT   = {POS_MAX_OFFSET_LEFT}\n"
+                f"POS_MAX_OFFSET_RIGHT  = {POS_MAX_OFFSET_RIGHT}\n"
+                f"LENK_EXPO             = {LENK_EXPO}\n"
+                f"LENK_TEMPO_KOPPLUNG   = {LENK_TEMPO_KOPPLUNG}")
 
     def _print_werte(self):
         print("[FAHRVERHALTEN] " + self._werte_text().replace("\n", "   "))
@@ -3025,14 +3761,30 @@ class DrivingTuneWindow:
             self._max_rechts = min(self._max_rechts, gy)
 
         zyklus   = ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP
-        winkel   = calc_turn(gy) if state in ("left", "right") else 0.0
         richtung = {"left": "LINKS", "right": "RECHTS"}.get(state, "geradeaus")
         tempo    = int(calc_speed(gx) * TURN_SPEED_FACTOR) if state in ("left", "right") \
             else calc_speed(gx)
+        dreht    = state in ("left", "right")
+
+        # Die beiden Steuerungsarten haben verschiedene Masseinheiten: Grad JE
+        # SCHRITT (die sich aufsummieren) gegenüber Grad KURSVERSATZ (die es
+        # nicht tun). Eine gemeinsame Anzeige wäre in einem der beiden Fälle
+        # irreführend.
+        if STEUERMODUS == STEUERMODUS_POSITION:
+            versatz = calc_kursversatz(gy) if dreht else 0.0
+            kopf = (f"gY jetzt : {gy:+.2f}  ->  {richtung:9s} "
+                    f"Kursversatz {versatz:+6.1f} Grad (bleibt stehen)")
+        else:
+            # Tempo mitgeben, damit die Anzeige die Tempo-Kopplung mit abbildet
+            # und nicht eine Drehrate zeigt, die so gar nicht gefahren wird.
+            winkel = calc_turn(gy, tempo=tempo) if dreht else 0.0
+            kopf = (f"gY jetzt : {gy:+.2f}  ->  {richtung:9s} {winkel:5.1f} "
+                    f"Grad je Schritt = {winkel / zyklus:6.0f} Grad/s")
+            if LENK_TEMPO_KOPPLUNG > 0:
+                kopf += f"  (Tempo-Kopplung {LENK_TEMPO_KOPPLUNG:.2f})"
 
         self.live_var.set(
-            f"gY jetzt : {gy:+.2f}  ->  {richtung:9s} {winkel:5.1f} Grad je Schritt "
-            f"= {winkel / zyklus:6.0f} Grad/s\n"
+            kopf + "\n"
             f"gX jetzt : {gx:+.2f}  ->  Tempo {tempo:3d}   "
             f"(Bereich {MIN_SPEED_DYN}...{MAX_SPEED_DYN}, "
             f"Vollgas ab gX {GX_FULL_SPEED:+.2f})\n"
@@ -3042,14 +3794,23 @@ class DrivingTuneWindow:
             f"{2/zyklus:.0f} Funkbefehle/s"
         )
 
-        zeilen = ["  Handdrehung |     links     |    rechts",
-                  "              | Grad    Grad/s| Grad    Grad/s",
-                  "  ------------+---------------+---------------"]
-        for n in self.VERGLEICHS_NEIGUNGEN:
-            li = calc_turn(+n) if +n > abs(GY_LEFT_THRESHOLD)  else 0.0
-            re = calc_turn(-n) if +n > abs(GY_RIGHT_THRESHOLD) else 0.0
-            zeilen.append(f"      {n:.2f}    |{li:6.1f} {li/zyklus:7.0f} "
-                          f"|{re:6.1f} {re/zyklus:7.0f}")
+        if STEUERMODUS == STEUERMODUS_POSITION:
+            zeilen = ["  Handdrehung |  Kursversatz",
+                      "              |  links   rechts",
+                      "  ------------+----------------"]
+            for n in self.VERGLEICHS_NEIGUNGEN:
+                li = -calc_kursversatz(+n) if +n > abs(GY_LEFT_THRESHOLD)  else 0.0
+                re = +calc_kursversatz(-n) if +n > abs(GY_RIGHT_THRESHOLD) else 0.0
+                zeilen.append(f"      {n:.2f}    | {li:6.1f}   {re:6.1f}")
+        else:
+            zeilen = ["  Handdrehung |     links     |    rechts",
+                      "              | Grad    Grad/s| Grad    Grad/s",
+                      "  ------------+---------------+---------------"]
+            for n in self.VERGLEICHS_NEIGUNGEN:
+                li = calc_turn(+n, tempo=tempo) if +n > abs(GY_LEFT_THRESHOLD)  else 0.0
+                re = calc_turn(-n, tempo=tempo) if +n > abs(GY_RIGHT_THRESHOLD) else 0.0
+                zeilen.append(f"      {n:.2f}    |{li:6.1f} {li/zyklus:7.0f} "
+                              f"|{re:6.1f} {re/zyklus:7.0f}")
         self.tabelle_var.set("\n".join(zeilen))
         self.code_var.set(self._werte_text())
         # Laufend nachziehen: Die Testperson kann im Hauptfenster gewechselt
@@ -3081,6 +3842,7 @@ def show_controller_ui():
     graph_window_ref = [None]
     camera_thread_ref = [None]
     tune_window_ref = [None]
+    aim_window_ref  = [None]
 
     # ── Probandenverwaltung ───────────────────────────────────────────────────
     try:
@@ -3307,14 +4069,19 @@ def show_controller_ui():
     # an die einzelne Testperson. Bewusst ein eigenes Fenster: Während der Fahrt
     # wird hier nachjustiert, das Hauptfenster soll dabei sichtbar bleiben.
     tune_button   = ttk.Button(buttons, text="🎛  Fahrverhalten justieren")
+    # Gehört direkt zur Inbetriebnahme: Ohne ausgerichtete Nullrichtung fährt
+    # der Sphero bei "vorwärts" in eine beliebige Richtung. Deshalb gleich
+    # neben "Sphero starten" und nicht in einem Untermenü.
+    aim_button    = ttk.Button(buttons, text="🧭  Sphero ausrichten")
     record_button = ttk.Button(buttons, text="⏺  Aufzeichnung starten")
 
     start_button.grid( row=0, column=0, sticky="ew", padx=(0, 6), pady=3)
     stop_button.grid(  row=0, column=1, sticky="ew",              pady=3)
-    graph_button.grid( row=1, column=0, sticky="ew", padx=(0, 6), pady=3)
-    camera_button.grid(row=1, column=1, sticky="ew",              pady=3)
-    tune_button.grid(  row=2, column=0, columnspan=2, sticky="ew", pady=3)
-    record_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+    aim_button.grid(   row=1, column=0, columnspan=2, sticky="ew", pady=3)
+    graph_button.grid( row=2, column=0, sticky="ew", padx=(0, 6), pady=3)
+    camera_button.grid(row=2, column=1, sticky="ew",              pady=3)
+    tune_button.grid(  row=3, column=0, columnspan=2, sticky="ew", pady=3)
+    record_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(3, 0))
     buttons.columnconfigure(0, weight=1)
     buttons.columnconfigure(1, weight=1)
 
@@ -3546,6 +4313,19 @@ def show_controller_ui():
             tune_window_ref[0] = DrivingTuneWindow(
                 root, speichern=fahrwerte_speichern, person_text=person_beschreibung)
 
+    def ausrichten_clicked():
+        aw = aim_window_ref[0]
+        if aw is not None and aw.win.winfo_exists():
+            aw.win.lift()
+            return
+        if sphero_api is None:
+            messagebox.showinfo(
+                "Sphero nicht verbunden",
+                "Bitte zuerst „Sphero starten“ drücken. Das Ausrichten sendet "
+                "Befehle an den Ball und braucht dafür eine Verbindung.")
+            return
+        aim_window_ref[0] = AusrichtFenster(root)
+
     def toggle_camera():
         cam = camera_thread_ref[0]
         if cam is not None and cam.is_alive():
@@ -3620,6 +4400,7 @@ def show_controller_ui():
     graph_button.config( command=toggle_graphs)
     camera_button.config(command=toggle_camera)
     tune_button.config(  command=toggle_tuning)
+    aim_button.config(   command=ausrichten_clicked)
     record_button.config(command=toggle_recording)
     root.protocol("WM_DELETE_WINDOW", on_close)
 
