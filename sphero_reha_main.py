@@ -124,6 +124,10 @@ latest_data = {
     "state": "neutral", "heading": 0,
     "backward_until": 0.0,
     "last_update": 0.0,   # time.time() der letzten echten Sensor-POST; 0.0 = noch nie
+    # Zuletzt empfangene Herzfrequenz. 0.0 = die Uhr hat noch keinen Puls
+    # geliefert (siehe valid_hr). Liegt hier und nicht nur im Graph-Puffer,
+    # damit die Ruhepulsmessung sie ohne Umweg über die Anzeige lesen kann.
+    "heart_rate": 0.0,
 }
 
 # Live-Graph-Daten (Zeitachse = t_abs_s der gemeinsamen Referenzuhr)
@@ -133,9 +137,26 @@ heart_rate_values = deque(maxlen=MAX_POINTS)
 graph_time_values = deque(maxlen=MAX_POINTS)
 
 # ── Sphero-Konfiguration ──────────────────────────────────────────────────────
+# Tempobereich der Vorwärtsfahrt. Der Sphero nimmt 0…255 entgegen; die hier
+# eingetragene Obergrenze ist eine bewusst gewählte Reserve, keine Gerätegrenze.
+# Beide Werte sind zur Laufzeit über "Fahrverhalten justieren" verstellbar,
+# damit dieselbe Anwendung von vorsichtigen und von sportlichen Testpersonen
+# gefahren werden kann, ohne dass am Code etwas geändert werden muss.
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
 TURN_SPEED_FACTOR    = 0.7
+
+# Handneigung, bei der das Höchsttempo erreicht ist (Hand weit nach unten
+# gekippt). Zusammen mit GX_FORWARD_MAX spannt dieser Wert die Tempo-Rampe auf:
+# bei GX_FORWARD_MAX fährt der Sphero MIN_SPEED_DYN, bei GX_FULL_SPEED
+# MAX_SPEED_DYN, dazwischen linear (siehe calc_speed).
+#
+# Warum einstellbar: Der nutzbare Neigungsbereich ist die eigentliche
+# Bewegungsaufgabe. Wer den Unterarm nur eingeschränkt senken kann, erreicht
+# -0.95 nie und bliebe dauerhaft im unteren Tempodrittel. Wird der Wert auf die
+# tatsächlich erreichte Neigung gesetzt, steht der volle Tempobereich wieder
+# über den ganzen individuellen Bewegungsumfang zur Verfügung.
+GX_FULL_SPEED        = -0.95
 
 # Wartezeit in Neutralstellung, bis der Stopp-Befehl geht (war 1.5).
 # Kleiner = der Sphero bleibt schneller stehen, wenn die Hand zurückgenommen
@@ -148,8 +169,8 @@ STOP_TIME            = 0.6
 # Links liegt bewusst NIEDRIGER als rechts: Bei am Handgelenk getragener Uhr
 # ist die Drehung in die eine Richtung anatomisch schwerer zu erreichen als in
 # die andere. Wer stattdessen symmetrisch fahren möchte, setzt beide auf 0.80.
-GY_RIGHT_THRESHOLD   = -0.80
-GY_LEFT_THRESHOLD    = +0.61
+GY_RIGHT_THRESHOLD   = -0.72
+GY_LEFT_THRESHOLD    = +0.60
 GX_FORWARD_MAX       = +0.1
 GX_NEUTRAL_THRESHOLD = +0.12
 # Maximaler Drehwinkel pro Schleifendurchlauf, getrennt je Seite.
@@ -203,9 +224,209 @@ BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
 BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
 DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine Daten", bleibt stehen
 
+# ── Fahrprofile ───────────────────────────────────────────────────────────────
+# Reproduzierbare Ausgangspunkte für eine Sitzung, damit nicht jede Testperson
+# mit zufällig stehengebliebenen Reglern startet. "Standard" entspricht exakt
+# den oben eingetragenen Werten.
+#
+# Bewusst enthalten die Profile NUR Fahrdynamik (Tempo, Wendigkeit, Takt).
+# Die Kippschwellen GY_*_THRESHOLD und GX_* bleiben unangetastet: Sie sind die
+# Anpassung an den Bewegungsumfang der jeweiligen Person und damit unabhängig
+# davon, ob jemand langsam oder sportlich fahren möchte. Ein Profilwechsel darf
+# eine einmal eingestellte Kalibrierung nicht überschreiben.
+#
+# Die Zahlen sind aus Testfahrten abgeleitet und keine normierten Stufen. Für
+# die Auswertung zählt nicht der Profilname, sondern die tatsächlich gefahrene
+# Einstellung: Sie steht in metadata.json ("config"), jede Änderung während der
+# Fahrt zusätzlich in events.csv.
+FAHRPROFILE = {
+    "Sanft": {
+        "MIN_SPEED_DYN": 20, "MAX_SPEED_DYN": 70,
+        "TURN_SPEED_FACTOR": 0.5,
+        "MAX_TURN_ANGLE_LEFT": 40, "MAX_TURN_ANGLE_RIGHT": 40,
+        "ROLL_COMMAND_DURATION": 0.08, "STOP_TIME": 0.8,
+        "BACKWARD_SPEED": 50,
+    },
+    "Standard": {
+        "MIN_SPEED_DYN": 30, "MAX_SPEED_DYN": 120,
+        "TURN_SPEED_FACTOR": 0.7,
+        "MAX_TURN_ANGLE_LEFT": 60, "MAX_TURN_ANGLE_RIGHT": 60,
+        "ROLL_COMMAND_DURATION": 0.06, "STOP_TIME": 0.6,
+        "BACKWARD_SPEED": 80,
+    },
+    "Sportlich": {
+        "MIN_SPEED_DYN": 45, "MAX_SPEED_DYN": 200,
+        "TURN_SPEED_FACTOR": 0.85,
+        "MAX_TURN_ANGLE_LEFT": 75, "MAX_TURN_ANGLE_RIGHT": 75,
+        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.4,
+        "BACKWARD_SPEED": 110,
+    },
+}
+
+# Welches Profil zuletzt gewählt wurde. PROFIL_MANUELL bedeutet: von Hand
+# verstellt, also keinem Profil mehr zuzuordnen. Steht in metadata.json und in
+# jedem Änderungsereignis, damit in der Auswertung nach Fahrstil gruppiert
+# werden kann.
+PROFIL_MANUELL  = "manuell"
+fahrprofil_name = "Standard"
+
+
+def fahrverhalten_werte() -> dict:
+    """
+    Momentaufnahme aller zur Laufzeit einstellbaren Fahrgrößen.
+
+    Eine gemeinsame Quelle für die Aufzeichnung (Ausgangsstand beim Start der
+    Sitzung) und für das Einstellfenster (Erkennen von Änderungen). Käme jede
+    Stelle mit einer eigenen Liste, würde ein neu hinzugefügter Regler früher
+    oder später an einer davon fehlen und in den Daten unsichtbar bleiben.
+    """
+    return {
+        "MIN_SPEED_DYN": MIN_SPEED_DYN, "MAX_SPEED_DYN": MAX_SPEED_DYN,
+        "GX_FULL_SPEED": GX_FULL_SPEED,
+        "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
+        "MAX_TURN_ANGLE_LEFT": MAX_TURN_ANGLE_LEFT,
+        "GY_RIGHT_THRESHOLD": GY_RIGHT_THRESHOLD,
+        "MAX_TURN_ANGLE_RIGHT": MAX_TURN_ANGLE_RIGHT,
+        "TURN_SPEED_FACTOR": TURN_SPEED_FACTOR,
+        "ROLL_COMMAND_DURATION": ROLL_COMMAND_DURATION,
+        "STOP_TIME": STOP_TIME,
+        "BACKWARD_SPEED": BACKWARD_SPEED,
+        "BACKWARD_DURATION": BACKWARD_DURATION,
+    }
+
+
+# Wertebereiche der einstellbaren Größen. Dieselben Grenzen wie die Regler im
+# Einstellfenster – hier zusätzlich als Prüfung beim Laden gespeicherter Werte:
+# Eine von Hand bearbeitete oder aus einer älteren Programmfassung stammende
+# participants.json darf dem Sphero keine unsinnigen Befehle einbringen.
+FAHRWERT_GRENZEN = {
+    "MIN_SPEED_DYN":         (0, 150),
+    "MAX_SPEED_DYN":         (20, 255),
+    "GX_FULL_SPEED":         (-0.95, -0.30),
+    "GY_LEFT_THRESHOLD":     (0.40, 0.95),
+    "MAX_TURN_ANGLE_LEFT":   (10, 90),
+    "GY_RIGHT_THRESHOLD":    (-0.95, -0.40),
+    "MAX_TURN_ANGLE_RIGHT":  (10, 90),
+    "TURN_SPEED_FACTOR":     (0.20, 1.00),
+    "ROLL_COMMAND_DURATION": (0.04, 0.15),
+    "STOP_TIME":             (0.2, 2.0),
+    "BACKWARD_SPEED":        (20, 200),
+    "BACKWARD_DURATION":     (0.5, 5.0),
+}
+
+_FAHRWERT_GANZZAHLIG = {
+    "MIN_SPEED_DYN", "MAX_SPEED_DYN", "MAX_TURN_ANGLE_LEFT",
+    "MAX_TURN_ANGLE_RIGHT", "BACKWARD_SPEED",
+}
+
+
+def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
+    """
+    Gespeicherte Fahrwerte übernehmen (Gegenstück zu fahrverhalten_werte).
+
+    Unbekannte Schlüssel werden übergangen, fehlende bleiben auf ihrem
+    bisherigen Stand, und jeder Wert wird auf seinen zulässigen Bereich
+    begrenzt. Damit kann eine unvollständige oder veraltete Datei die Steuerung
+    nicht in einen unfahrbaren Zustand bringen – im schlimmsten Fall gilt
+    weiterhin die Voreinstellung.
+
+    Rückgabe: Namen der tatsächlich geänderten Größen.
+    """
+    global MIN_SPEED_DYN, MAX_SPEED_DYN, GX_FULL_SPEED
+    global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
+    global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
+    global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
+    global STOP_TIME, BACKWARD_SPEED, BACKWARD_DURATION
+    global fahrprofil_name
+
+    if not isinstance(werte, dict):
+        return []
+
+    vorher   = fahrverhalten_werte()
+    geprueft = {}
+    for name, grenzen in FAHRWERT_GRENZEN.items():
+        if name not in werte:
+            continue
+        try:
+            wert = float(werte[name])
+        except (TypeError, ValueError):
+            continue
+        untere, obere = grenzen
+        wert = max(untere, min(obere, wert))
+        geprueft[name] = int(round(wert)) if name in _FAHRWERT_GANZZAHLIG else wert
+
+    # Das Grundtempo darf das Höchsttempo nicht überschreiten, sonst kehrt sich
+    # die Rampe in calc_speed() um (vgl. DrivingTuneWindow._anwenden).
+    neu_min = geprueft.get("MIN_SPEED_DYN", MIN_SPEED_DYN)
+    neu_max = geprueft.get("MAX_SPEED_DYN", MAX_SPEED_DYN)
+    if neu_min > neu_max:
+        geprueft["MIN_SPEED_DYN"] = neu_max
+
+    MIN_SPEED_DYN         = geprueft.get("MIN_SPEED_DYN", MIN_SPEED_DYN)
+    MAX_SPEED_DYN         = geprueft.get("MAX_SPEED_DYN", MAX_SPEED_DYN)
+    GX_FULL_SPEED         = round(geprueft.get("GX_FULL_SPEED", GX_FULL_SPEED), 2)
+    GY_LEFT_THRESHOLD     = round(geprueft.get("GY_LEFT_THRESHOLD", GY_LEFT_THRESHOLD), 3)
+    MAX_TURN_ANGLE_LEFT   = geprueft.get("MAX_TURN_ANGLE_LEFT", MAX_TURN_ANGLE_LEFT)
+    GY_RIGHT_THRESHOLD    = round(geprueft.get("GY_RIGHT_THRESHOLD", GY_RIGHT_THRESHOLD), 3)
+    MAX_TURN_ANGLE_RIGHT  = geprueft.get("MAX_TURN_ANGLE_RIGHT", MAX_TURN_ANGLE_RIGHT)
+    TURN_SPEED_FACTOR     = round(geprueft.get("TURN_SPEED_FACTOR", TURN_SPEED_FACTOR), 2)
+    ROLL_COMMAND_DURATION = round(geprueft.get("ROLL_COMMAND_DURATION", ROLL_COMMAND_DURATION), 3)
+    STOP_TIME             = round(geprueft.get("STOP_TIME", STOP_TIME), 2)
+    BACKWARD_SPEED        = geprueft.get("BACKWARD_SPEED", BACKWARD_SPEED)
+    BACKWARD_DURATION     = round(geprueft.get("BACKWARD_DURATION", BACKWARD_DURATION), 1)
+
+    if profil:
+        fahrprofil_name = profil
+
+    nachher = fahrverhalten_werte()
+    return [name for name in nachher if vorher[name] != nachher[name]]
+
+# ── Herzfrequenzzonen ─────────────────────────────────────────────────────────
+# Früher standen hier zwei feste Werte (100 / 120 BPM). Für einen Vergleich über
+# Altersdekaden ist das nicht haltbar: Die maximale Herzfrequenz sinkt mit dem
+# Alter um grob 0,7 Schläge pro Lebensjahr. 120 BPM sind für eine 30-jährige
+# Person eine lockere Aufwärmintensität und für eine 80-jährige bereits ein
+# deutlich anstrengender Bereich – dieselbe Zahl bedeutet also je nach Gruppe
+# etwas völlig anderes, und genau das macht die Gruppen unvergleichbar.
+#
+# Die Zonen werden deshalb bei der Auswahl einer Testperson aus deren Alter und
+# – sofern gemessen – deren Ruhepuls berechnet (siehe hr_zonen).
+#
+# WICHTIG: Das sind Intensitätsgrenzen aus der Trainingswissenschaft, keine
+# medizinischen Grenzwerte. Die gesundheitliche Eignung klärt der PAR-Q und die
+# Studienleitung; diese Anwendung ist kein Medizinprodukt.
+
+# Solange keine Testperson gewählt ist (freies Testen), bleibt es bei den alten
+# absoluten Werten – dann ist kein Alter bekannt, aus dem sich rechnen ließe.
+HR_WARN_DEFAULT   = 100
+HR_DANGER_DEFAULT = 120
+
+# Maximale Herzfrequenz nach Tanaka et al. (2001), Meta-Analyse über 351
+# Studien: HFmax = 208 - 0,7 x Alter. Deutlich besser belegt als die verbreitete
+# Faustformel 220 - Alter, die bei jungen Menschen zu hoch und bei älteren zu
+# niedrig liegt – also ausgerechnet den Altersvergleich verzerren würde.
+HR_MAX_INTERCEPT = 208.0
+HR_MAX_SLOPE     = 0.7
+
+# Zonengrenzen nach der Intensitätseinteilung des ACSM.
+# Mit Ruhepuls wird über die Herzfrequenzreserve gerechnet (Karvonen), ohne
+# Ruhepuls ersatzweise über den Prozentsatz der maximalen Herzfrequenz. Die
+# beiden Prozentsätze sind NICHT austauschbar – sie beziehen sich auf
+# verschiedene Skalen und sind deshalb getrennt hinterlegt.
+HR_WARN_PCT_HRR    = 0.60   # Übergang moderat -> anstrengend
+HR_DANGER_PCT_HRR  = 0.85   # Übergang anstrengend -> nahezu maximal
+HR_WARN_PCT_MAX    = 0.77
+HR_DANGER_PCT_MAX  = 0.94
+
+HR_WARN    = HR_WARN_DEFAULT
+HR_DANGER  = HR_DANGER_DEFAULT
+
+# Klartext, wie die aktuellen Zonen zustande kamen – für Anzeige, metadata.json
+# und Ereignisprotokoll. Ohne diese Angabe wäre später nicht mehr erkennbar, ob
+# eine Sitzung mit Karvonen-Zonen oder mit Ersatzwerten gefahren wurde.
+hr_zonen_herkunft = "Standardwerte (keine Testperson gewählt)"
+
 # ── Live-Graph-Konfiguration ─────────────────────────────────────────────────
-HR_WARN    = 100
-HR_DANGER  = 120
 SMOOTH_WIN = 10
 
 # ── Video ─────────────────────────────────────────────────────────────────────
@@ -267,7 +488,20 @@ def korrigiere_tragearm(gx, gy, gz):
 
 
 def calc_speed(gx) -> int:
-    intensity = (0.10 - gx) / (0.10 - (-0.95))
+    """
+    Fahrtempo aus der Handneigung.
+
+    Lineare Rampe zwischen den beiden Enden des nutzbaren Neigungsbereichs:
+    bei GX_FORWARD_MAX (Hand knapp unter der Fahrschwelle) fährt der Sphero
+    MIN_SPEED_DYN, bei GX_FULL_SPEED (Hand voll gesenkt) MAX_SPEED_DYN.
+
+    Beide Enden standen früher als Zahlen in dieser Formel. Sie sind jetzt
+    dieselben Konstanten, die auch get_state() und die Oberfläche verwenden –
+    sonst würde ein Verstellen der Fahrschwelle die Tempo-Rampe stillschweigend
+    gegen die Zustandserkennung verschieben.
+    """
+    span      = GX_FORWARD_MAX - GX_FULL_SPEED
+    intensity = (GX_FORWARD_MAX - gx) / span if span > 1e-6 else 0.0
     intensity = max(0.0, min(1.0, intensity))
     return int(MIN_SPEED_DYN + intensity * (MAX_SPEED_DYN - MIN_SPEED_DYN))
 
@@ -326,6 +560,79 @@ def valid_hr(hr) -> bool:
         return 30.0 <= float(hr) <= 240.0
     except (TypeError, ValueError):
         return False
+
+
+def hr_max_tanaka(age_years) -> float:
+    """Maximale Herzfrequenz nach Tanaka et al. (2001): 208 - 0,7 x Alter."""
+    return HR_MAX_INTERCEPT - HR_MAX_SLOPE * float(age_years)
+
+
+def hr_zonen(age_years, ruhepuls=None) -> dict:
+    """
+    Individuelle Warn- und Gefahrenschwelle für die Herzfrequenz.
+
+    Mit Ruhepuls wird nach Karvonen über die Herzfrequenzreserve gerechnet:
+        Zielpuls = Ruhepuls + Anteil x (HFmax - Ruhepuls)
+    Das ist die genauere Variante, weil sie die individuelle Leistungsfähigkeit
+    einbezieht – zwei gleichaltrige Personen mit Ruhepuls 50 und 80 haben bei
+    derselben absoluten Herzfrequenz eine deutlich verschiedene Beanspruchung.
+
+    Ohne Ruhepuls bleibt nur der Prozentsatz der maximalen Herzfrequenz. Das
+    Ergebnis ist gröber, aber immer noch altersnormiert und damit über die
+    Gruppen hinweg vergleichbar.
+
+    Rückgabe enthält neben den Schwellen auch, wie sie zustande kamen – diese
+    Angabe wandert in die Sitzungs-Metadaten.
+    """
+    hrmax = hr_max_tanaka(age_years)
+    if valid_hr(ruhepuls):
+        ruhe    = float(ruhepuls)
+        reserve = hrmax - ruhe
+        warn    = ruhe + HR_WARN_PCT_HRR   * reserve
+        gefahr  = ruhe + HR_DANGER_PCT_HRR * reserve
+        verfahren = "Karvonen (Herzfrequenzreserve)"
+        herkunft  = (f"Alter {int(age_years)} J. -> HFmax {hrmax:.0f}, "
+                     f"Ruhepuls {ruhe:.0f} -> Reserve {reserve:.0f} BPM "
+                     f"({int(HR_WARN_PCT_HRR*100)} % / "
+                     f"{int(HR_DANGER_PCT_HRR*100)} % der Reserve)")
+    else:
+        ruhe      = None
+        warn      = HR_WARN_PCT_MAX   * hrmax
+        gefahr    = HR_DANGER_PCT_MAX * hrmax
+        verfahren = "Prozent der maximalen Herzfrequenz (kein Ruhepuls gemessen)"
+        herkunft  = (f"Alter {int(age_years)} J. -> HFmax {hrmax:.0f} "
+                     f"({int(HR_WARN_PCT_MAX*100)} % / "
+                     f"{int(HR_DANGER_PCT_MAX*100)} % von HFmax)")
+
+    return {
+        "warn":       int(round(warn)),
+        "gefahr":     int(round(gefahr)),
+        "hr_max":     round(hrmax, 1),
+        "ruhepuls":   ruhe,
+        "verfahren":  verfahren,
+        "herkunft":   herkunft,
+    }
+
+
+def setze_hr_zonen(record) -> str:
+    """
+    Herzfrequenzzonen auf die gewählte Testperson umstellen.
+
+    Ohne Testperson (freies Testen) wird auf die absoluten Vorgabewerte
+    zurückgeschaltet, damit nicht versehentlich die Zonen der zuvor gewählten
+    Person weitergelten.
+    """
+    global HR_WARN, HR_DANGER, hr_zonen_herkunft
+
+    if not record or not record.get("age_years"):
+        HR_WARN, HR_DANGER = HR_WARN_DEFAULT, HR_DANGER_DEFAULT
+        hr_zonen_herkunft  = "Standardwerte (keine Testperson gewählt)"
+        return hr_zonen_herkunft
+
+    zonen = hr_zonen(record["age_years"], record.get("resting_hr_bpm"))
+    HR_WARN, HR_DANGER = zonen["warn"], zonen["gefahr"]
+    hr_zonen_herkunft  = f"{zonen['verfahren']}: {zonen['herkunft']}"
+    return hr_zonen_herkunft
 
 
 def compute_load_index(intensities: list, heart_rates: list) -> list:
@@ -488,6 +795,18 @@ class SessionRecorder:
             self._log_event_locked(
                 "video_consent", "erteilt" if self.video_consent else "nicht erteilt")
             self._log_event_locked("watch_arm", self._watch_arm)
+            # Ausgangsstand des Fahrverhaltens festhalten. metadata.json enthält
+            # am Ende nur den Schlussstand; erst zusammen mit diesem Eintrag und
+            # den "fahrverhalten_geaendert"-Ereignissen lässt sich für jeden
+            # Zeitpunkt der Aufzeichnung rekonstruieren, womit gefahren wurde.
+            self._log_event_locked(
+                "fahrverhalten_start",
+                f"profil={fahrprofil_name}; "
+                + "; ".join(f"{name}: {wert}"
+                            for name, wert in fahrverhalten_werte().items()))
+            self._log_event_locked(
+                "herzfrequenzzonen",
+                f"Warnung {HR_WARN} BPM; Gefahr {HR_DANGER} BPM; {hr_zonen_herkunft}")
             return self.session_dir
 
     def stop(self):
@@ -708,8 +1027,15 @@ class SessionRecorder:
             },
             "subsystems_active": self._subsystems_seen,
             "row_counts": dict(self._counts),
+            # ACHTUNG bei der Auswertung: Hier steht der Stand zum Zeitpunkt des
+            # Schreibens, am Ende der Sitzung also der SCHLUSSSTAND. Wurde das
+            # Fahrverhalten während der Aufzeichnung verstellt, steht der
+            # Ausgangsstand im Ereignis "fahrverhalten_start" und jede einzelne
+            # Änderung als "fahrverhalten_geaendert" in events.csv.
             "config": {
+                "fahrprofil": fahrprofil_name,
                 "MIN_SPEED_DYN": MIN_SPEED_DYN, "MAX_SPEED_DYN": MAX_SPEED_DYN,
+                "GX_FULL_SPEED": GX_FULL_SPEED,
                 "TURN_SPEED_FACTOR": TURN_SPEED_FACTOR, "STOP_TIME": STOP_TIME,
                 "GY_RIGHT_THRESHOLD": GY_RIGHT_THRESHOLD, "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
                 "GX_FORWARD_MAX": GX_FORWARD_MAX, "GX_NEUTRAL_THRESHOLD": GX_NEUTRAL_THRESHOLD,
@@ -719,7 +1045,20 @@ class SessionRecorder:
                 "CONTROL_LOOP_SLEEP": CONTROL_LOOP_SLEEP,
                 "BACKWARD_DURATION": BACKWARD_DURATION, "BACKWARD_SPEED": BACKWARD_SPEED,
                 "DATA_TIMEOUT": DATA_TIMEOUT,
-                "HR_WARN": HR_WARN, "HR_DANGER": HR_DANGER,
+            },
+            # Die Herzfrequenzzonen sind personenabhängig und werden aus Alter
+            # und (falls gemessen) Ruhepuls berechnet. Ohne diese Angaben wäre
+            # in der Auswertung nicht rekonstruierbar, worauf eine Warnung in
+            # dieser Sitzung beruhte – und Sitzungen verschiedener Altersgruppen
+            # wären nicht vergleichbar.
+            "herzfrequenz": {
+                "warn_bpm":       HR_WARN,
+                "gefahr_bpm":     HR_DANGER,
+                "herkunft":       hr_zonen_herkunft,
+                "resting_hr_bpm": (self._participant or {}).get("resting_hr_bpm"),
+                "hinweis": ("Intensitätsgrenzen nach der Einteilung des ACSM, "
+                            "HFmax nach Tanaka et al. (2001). Keine medizinischen "
+                            "Grenzwerte."),
             },
             "files": {
                 "sensor_log": "sensor.csv", "control_log": "control.csv",
@@ -861,6 +1200,7 @@ def sensorlog():
         latest_data["gz"]          = gz
         latest_data["state"]       = state
         latest_data["last_update"] = time.time()
+        latest_data["heart_rate"]  = hr
         intensity_values.append(intensity)
         heart_rate_values.append(hr)
         graph_time_values.append(t_abs)
@@ -2053,65 +2393,323 @@ class LiveGraphWindow:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lenkung feinjustieren (temporäres Hilfsfenster)
+# Ruhepuls messen
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SteeringTuneWindow:
+class RuhepulsFenster:
     """
-    Schieberegler für ALLE Faktoren, die das Kurvenverhalten beeinflussen.
+    Geführte Messung des Ruhepulses als Bezugsgröße für die Herzfrequenzzonen.
 
-    Gedacht als Werkzeug zum Einstellen, nicht als Dauerfunktion: Wenn die
-    passenden Werte gefunden sind, können sie oben in der Datei fest eingetragen
-    und dieses Fenster samt Button entfernt werden. Die Regler schreiben direkt
-    in die Modulvariablen, die die Steuerungsschleife bei jedem Durchlauf neu
-    liest – Änderungen wirken deshalb sofort, ohne Neustart.
+    Ablauf: Die Person sitzt ruhig, die Uhr sendet weiter ihre Werte. Über die
+    Messdauer werden alle plausiblen Herzfrequenzen gesammelt; als Ergebnis
+    dient der MEDIAN, nicht der Mittelwert. Ein einzelner Ausreißer – ein
+    Bewegungsartefakt der optischen Messung, ein kurzer Schreck – verschiebt den
+    Median kaum, den Mittelwert dagegen deutlich. Da der Ruhepuls anschließend
+    die gesamte Zonenberechnung trägt, würde sich ein solcher Fehler auf jede
+    Warnschwelle dieser Person durchschlagen.
 
-    Die vier Faktoren und wie sie zusammenwirken:
+    Die ersten Sekunden werden verworfen (EINSCHWINGEN_S): Direkt nach dem
+    Hinsetzen ist der Puls noch erhöht, und die Uhr braucht einen Moment, bis
+    ihre Messung stabil ist.
+    """
 
-      1. Schwelle (je Seite)      – ab wann die Kurve überhaupt beginnt
-      2. Max. Winkel (je Seite)   – wie viel Grad pro Schleifendurchlauf
-      3. Kurven-Tempo             – wie schnell er in der Kurve fährt
-      4. Zykluszeit               – wie oft pro Sekunde gelenkt wird
+    MESSDAUER_S    = 60      # Gesamtdauer der Messung
+    EINSCHWINGEN_S = 15      # davon Vorlauf, dessen Werte verworfen werden
+    TAKT_MS        = 500     # Abtastung der zuletzt empfangenen Herzfrequenz
+    MIN_WERTE      = 10      # weniger Messpunkte gelten als nicht verwertbar
 
-    Punkt 4 ist der am wenigsten offensichtliche: Der Winkel aus Punkt 2 wird
+    def __init__(self, parent, teilnehmer_id: str, alter: int, fertig=None):
+        self.win = tk.Toplevel(parent)
+        self.win.title(f"Ruhepuls messen – {teilnehmer_id}")
+        self.win.geometry("520x430")
+        self.win.transient(parent)
+
+        self.teilnehmer_id = teilnehmer_id
+        self.alter    = alter
+        self._fertig  = fertig or (lambda bpm: None)
+        self._werte   = []
+        self._läuft   = False
+        self._job     = None
+        self._start_t = 0.0
+        self.ergebnis = None
+
+        rahmen = ttk.Frame(self.win, padding=16)
+        rahmen.pack(fill="both", expand=True)
+
+        ttk.Label(rahmen, text="Ruhepuls messen",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(rahmen,
+                  text=f"Die Testperson sitzt entspannt und bewegt sich {self.MESSDAUER_S} "
+                       f"Sekunden lang nicht. Die Apple Watch muss getragen werden und "
+                       f"Daten senden.\n\n"
+                       f"Der Ruhepuls legt zusammen mit dem Alter fest, ab welcher "
+                       f"Herzfrequenz gewarnt wird. Ohne ihn muss die Anwendung auf "
+                       f"gröbere Ersatzwerte ausweichen.",
+                  foreground="#555", wraplength=470,
+                  justify="left").pack(anchor="w", pady=(6, 12))
+
+        self.status_var = tk.StringVar(value="Bereit.")
+        ttk.Label(rahmen, textvariable=self.status_var, font=("Segoe UI", 11),
+                  wraplength=470, justify="left").pack(anchor="w")
+
+        self.live_var = tk.StringVar(value="")
+        ttk.Label(rahmen, textvariable=self.live_var, font=("Consolas", 24, "bold"),
+                  foreground="#c00").pack(anchor="w", pady=(8, 4))
+
+        self.fortschritt = ttk.Progressbar(rahmen, maximum=self.MESSDAUER_S)
+        self.fortschritt.pack(fill="x", pady=(4, 10))
+
+        self.detail_var = tk.StringVar(value="")
+        ttk.Label(rahmen, textvariable=self.detail_var, font=("Consolas", 9),
+                  foreground="#555", wraplength=470,
+                  justify="left").pack(anchor="w")
+
+        knoepfe = ttk.Frame(rahmen)
+        knoepfe.pack(fill="x", side="bottom", pady=(14, 0))
+        self.start_button = ttk.Button(knoepfe, text="▶  Messung starten",
+                                       command=self.starten)
+        self.start_button.pack(side="left")
+        ttk.Button(knoepfe, text="Schliessen", command=self.close).pack(side="right")
+
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+    # ── Ablauf ────────────────────────────────────────────────────────────────
+
+    def starten(self):
+        if self._läuft:
+            return
+        # Ohne laufenden Server empfängt die Anwendung gar keine Uhrdaten – dann
+        # liefe die Messung eine Minute lang ins Leere.
+        start_server_once()
+
+        with data_lock:
+            letzte = latest_data["last_update"]
+        if letzte == 0.0 or time.time() - letzte > DATA_TIMEOUT:
+            messagebox.showwarning(
+                "Keine Daten von der Uhr",
+                "Es kommen gerade keine Sensordaten an.\n\n"
+                "Bitte zuerst die App auf der Apple Watch starten und prüfen, "
+                "dass sie an diesen Rechner sendet.",
+                parent=self.win)
+            return
+
+        self._werte   = []
+        self._läuft   = True
+        self._start_t = time.time()
+        self.start_button.config(state="disabled")
+        recorder.log_event("ruhepuls_messung_start", self.teilnehmer_id)
+        self._tick()
+
+    def _tick(self):
+        if not self._läuft:
+            return
+        verstrichen = time.time() - self._start_t
+
+        with data_lock:
+            hr     = latest_data["heart_rate"]
+            letzte = latest_data["last_update"]
+
+        daten_frisch = letzte != 0.0 and time.time() - letzte <= DATA_TIMEOUT
+        if valid_hr(hr) and daten_frisch and verstrichen >= self.EINSCHWINGEN_S:
+            self._werte.append(float(hr))
+
+        self.live_var.set(f"{hr:.0f} BPM" if valid_hr(hr) else "-- BPM")
+        self.fortschritt["value"] = min(verstrichen, self.MESSDAUER_S)
+
+        if verstrichen < self.EINSCHWINGEN_S:
+            self.status_var.set(
+                f"Einschwingen... noch {self.EINSCHWINGEN_S - verstrichen:.0f} s "
+                f"(diese Werte zaehlen nicht)")
+        else:
+            self.status_var.set(
+                f"Messung laeuft... noch {max(0, self.MESSDAUER_S - verstrichen):.0f} s")
+
+        if not daten_frisch:
+            self.detail_var.set("Achtung: gerade keine Daten von der Uhr.")
+        else:
+            self.detail_var.set(f"{len(self._werte)} verwertbare Messpunkte")
+
+        if verstrichen >= self.MESSDAUER_S:
+            self._abschliessen()
+            return
+        self._job = self.win.after(self.TAKT_MS, self._tick)
+
+    def _abschliessen(self):
+        self._läuft = False
+        self.start_button.config(state="normal")
+        self.fortschritt["value"] = self.MESSDAUER_S
+
+        if len(self._werte) < self.MIN_WERTE:
+            self.status_var.set("Zu wenige verwertbare Messwerte.")
+            self.detail_var.set(
+                f"Nur {len(self._werte)} Messpunkte (mindestens {self.MIN_WERTE} noetig). "
+                "Sitzt die Uhr richtig auf und sendet sie durchgehend?")
+            recorder.log_event("ruhepuls_messung_abbruch",
+                               f"nur {len(self._werte)} Messpunkte")
+            return
+
+        werte  = sorted(self._werte)
+        mitte  = len(werte) // 2
+        median = (werte[mitte] if len(werte) % 2
+                  else (werte[mitte - 1] + werte[mitte]) / 2.0)
+        self.ergebnis = int(round(median))
+
+        zonen = hr_zonen(self.alter, self.ergebnis)
+        self.status_var.set(f"Ruhepuls: {self.ergebnis} BPM")
+        self.live_var.set(f"{self.ergebnis} BPM")
+        self.detail_var.set(
+            f"Median aus {len(werte)} Messpunkten (Spanne {werte[0]:.0f}"
+            f"...{werte[-1]:.0f} BPM)\n"
+            f"Daraus: Warnung ab {zonen['warn']} BPM, Gefahr ab {zonen['gefahr']} BPM\n"
+            f"{zonen['verfahren']}")
+        recorder.log_event("ruhepuls_gemessen",
+                           f"{self.ergebnis} BPM aus {len(werte)} Messpunkten")
+        self._fertig(self.ergebnis)
+
+    def close(self):
+        self._läuft = False
+        if self._job is not None:
+            try:
+                self.win.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self.win.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fahrverhalten justieren
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DrivingTuneWindow:
+    """
+    Schieberegler für ALLE Faktoren, die das Fahrverhalten bestimmen.
+
+    Ursprünglich nur für die Lenkung gedacht ("Lenkung feinjustieren"), deckt
+    das Fenster inzwischen Tempo, Lenkung, Anhalten und Rückwärtsfahrt ab – also
+    das vollständige Fahrverhalten. Es ist damit kein Werkzeug für die
+    Entwicklung mehr, sondern die Stelle, an der die Steuerung an die einzelne
+    Testperson angepasst wird.
+
+    Die Regler schreiben direkt in die Modulvariablen, die die Steuerungsschleife
+    bei jedem Durchlauf neu liest – Änderungen wirken deshalb sofort, ohne
+    Neustart und ohne die laufende Aufzeichnung zu unterbrechen.
+
+    Wie die Größen zusammenwirken:
+
+      1. Grund-/Höchsttempo       – Tempobereich der Geradeausfahrt
+      2. Schwelle (je Seite)      – ab wann die Kurve überhaupt beginnt
+      3. Max. Winkel (je Seite)   – wie viel Grad pro Schleifendurchlauf
+      4. Kurven-Tempo             – wie schnell er in der Kurve fährt
+      5. Zykluszeit               – wie oft pro Sekunde gelenkt wird
+
+    Punkt 5 ist der am wenigsten offensichtliche: Der Winkel aus Punkt 3 wird
     PRO DURCHLAUF aufaddiert. Die tatsächliche Drehgeschwindigkeit ist deshalb
     Winkel geteilt durch Zykluszeit. Wer nur am Winkel dreht, ändert damit
     immer auch die Drehgeschwindigkeit.
+
+    Nachvollziehbarkeit: Jede Änderung wird in events.csv festgehalten (siehe
+    _log_changes). Ohne das wäre in der Auswertung nicht mehr zu erkennen,
+    warum sich das Tempo mitten in einer Aufzeichnung ändert – metadata.json
+    hält nur den Stand am Ende der Sitzung fest.
     """
 
     VERGLEICHS_NEIGUNGEN = (0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
 
-    def __init__(self, parent: tk.Tk):
+    # Sphero-Obergrenze für roll(). Höhere Werte nimmt das Gerät nicht an.
+    SPEED_MAX = 255
+
+    # Wartezeit nach der letzten Reglerbewegung, bevor die Änderung ins
+    # Ereignisprotokoll geht. Ohne diese Verzögerung entstünde beim Ziehen
+    # eines Reglers pro Pixel ein Protokolleintrag.
+    LOG_DEBOUNCE_MS = 700
+
+    def __init__(self, parent: tk.Tk, speichern=None, person_text=None):
+        """
+        `speichern` wird vom Hauptfenster gestellt und legt die aktuellen Werte
+        bei der gewählten Testperson ab; es gibt einen Rückmeldetext zurück.
+        Die Probandenverwaltung bleibt damit Sache des Hauptfensters – dieses
+        Fenster kennt nur Regler.
+        """
         self.win = tk.Toplevel(parent)
-        self.win.title("Lenkung feinjustieren")
-        self.win.geometry("660x760")
+        self.win.title("Fahrverhalten justieren")
+        self.win.geometry("660x800")
         self.win.minsize(600, 500)
+
+        self._speichern_cb = speichern
+        self._person_text  = person_text or (lambda: "keine Testperson ausgewählt")
 
         self._max_links  = 0.0     # größter erreichter Ausschlag nach links
         self._max_rechts = 0.0     # ... und nach rechts
         self._running    = True
+        self._log_job    = None
+        self._anwenden_laeuft = False
+        self._geloggt    = fahrverhalten_werte()
 
-        scroll = probanden._ScrollFrame(self.win, height=640)
+        scroll = probanden._ScrollFrame(self.win, height=650)
         scroll.pack(fill="both", expand=True, padx=14, pady=(12, 0))
         self._scroll = scroll
         main = scroll.inner
 
-        ttk.Label(main, text="Lenkung einstellen",
+        ttk.Label(main, text="Fahrverhalten einstellen",
                   font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(main,
-                  text="Alle Regler wirken sofort, auch während der Sphero fährt.",
+                  text="Alle Regler wirken sofort, auch während der Sphero fährt. "
+                       "Änderungen werden in der laufenden Aufzeichnung vermerkt.",
                   foreground="#555", wraplength=580,
                   justify="left").pack(anchor="w", pady=(4, 10))
 
         # ── Regelgrößen ───────────────────────────────────────────────────────
+        self.var_tempo_min  = tk.DoubleVar(value=float(MIN_SPEED_DYN))
+        self.var_tempo_max  = tk.DoubleVar(value=float(MAX_SPEED_DYN))
         self.var_schwelle_l = tk.DoubleVar(value=abs(GY_LEFT_THRESHOLD))
         self.var_winkel_l   = tk.DoubleVar(value=float(MAX_TURN_ANGLE_LEFT))
         self.var_schwelle_r = tk.DoubleVar(value=abs(GY_RIGHT_THRESHOLD))
         self.var_winkel_r   = tk.DoubleVar(value=float(MAX_TURN_ANGLE_RIGHT))
         self.var_tempo      = tk.DoubleVar(value=float(TURN_SPEED_FACTOR))
         self.var_zyklus     = tk.DoubleVar(value=float(ROLL_COMMAND_DURATION))
+        self.var_vollgas    = tk.DoubleVar(value=abs(GX_FULL_SPEED))
+        self.var_stoppzeit  = tk.DoubleVar(value=float(STOP_TIME))
+        self.var_rueck_v    = tk.DoubleVar(value=float(BACKWARD_SPEED))
+        self.var_rueck_t    = tk.DoubleVar(value=float(BACKWARD_DURATION))
 
-        self._abschnitt(main, "1  Linkskurve")
+        # ── Fahrprofile ───────────────────────────────────────────────────────
+        self._abschnitt(main, "Fahrprofil")
+        ttk.Label(main,
+                  text="Setzt Tempo und Wendigkeit auf einen erprobten Ausgangspunkt. "
+                       "Die Kippschwellen bleiben dabei unverändert – sie gehören zur "
+                       "Person, nicht zum Fahrstil.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        profil_reihe = ttk.Frame(main)
+        profil_reihe.pack(fill="x", pady=(0, 2))
+        for name in FAHRPROFILE:
+            ttk.Button(profil_reihe, text=name,
+                       command=lambda n=name: self._profil_anwenden(n)
+                       ).pack(side="left", padx=(0, 6))
+        self.profil_var = tk.StringVar(
+            value="aktuell: von Hand eingestellt" if fahrprofil_name == PROFIL_MANUELL
+            else f"aktuell: Profil {fahrprofil_name}")
+        ttk.Label(main, textvariable=self.profil_var, foreground="#06c",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 0))
+
+        self._abschnitt(main, "1  Tempo geradeaus")
+        self._regler(main, "Grundtempo", self.var_tempo_min, 0, 150, 1,
+                     "hoeher = er rollt schon bei leichter Handneigung zuegig los",
+                     "tiefer = die Fahrt beginnt ganz sachte (leichter zu "
+                     "kontrollieren, gut fuer den ersten Versuch)")
+        self._regler(main, "Hoechsttempo", self.var_tempo_max, 20, self.SPEED_MAX, 5,
+                     "hoeher = bei voll gesenkter Hand faehrt er deutlich schneller "
+                     "(fuer sportliche Testpersonen)",
+                     "tiefer = das Tempo bleibt insgesamt gedaempft, mehr Zeit zum "
+                     "Reagieren")
+        self._regler(main, "Neigung fuer Vollgas", self.var_vollgas, 0.30, 0.95, 0.05,
+                     "hoeher = das Hoechsttempo verlangt eine weit gesenkte Hand "
+                     "(feinere Dosierung ueber den ganzen Weg)",
+                     "tiefer = das Hoechsttempo ist schon bei wenig Neigung erreicht "
+                     "(fuer eingeschraenkte Beweglichkeit)")
+
+        self._abschnitt(main, "2  Linkskurve")
         self._regler(main, "Schwelle links", self.var_schwelle_l, 0.40, 0.95, 0.01,
                      "hoeher = Hand muss weiter gedreht werden, bevor die Kurve beginnt",
                      "tiefer = Kurve beginnt schon bei leichter Drehung (leichter, "
@@ -2120,7 +2718,7 @@ class SteeringTuneWindow:
                      "hoeher = bei voller Handdrehung dreht er schaerfer/enger",
                      "tiefer = die Kurve wird weiter und sanfter")
 
-        self._abschnitt(main, "2  Rechtskurve")
+        self._abschnitt(main, "3  Rechtskurve")
         self._regler(main, "Schwelle rechts", self.var_schwelle_r, 0.40, 0.95, 0.01,
                      "hoeher = Hand muss weiter gedreht werden, bevor die Kurve beginnt",
                      "tiefer = Kurve beginnt schon bei leichter Drehung")
@@ -2128,7 +2726,7 @@ class SteeringTuneWindow:
                      "hoeher = bei voller Handdrehung dreht er schaerfer/enger",
                      "tiefer = die Kurve wird weiter und sanfter")
 
-        self._abschnitt(main, "3  Gilt fuer beide Seiten")
+        self._abschnitt(main, "4  Gilt fuer beide Seiten")
         self._regler(main, "Kurven-Tempo", self.var_tempo, 0.20, 1.00, 0.05,
                      "hoeher = er faehrt in der Kurve schneller -> weiter Bogen",
                      "tiefer = er wird in der Kurve langsamer -> dreht enger, "
@@ -2138,6 +2736,18 @@ class SteeringTuneWindow:
                      "schont die Funkverbindung",
                      "tiefer = oefter gelenkt: dreht schneller, reagiert direkter, "
                      "mehr Funklast (Abrissgefahr)")
+
+        self._abschnitt(main, "5  Anhalten und Rueckwaerts")
+        self._regler(main, "Nachlauf bis Stopp (s)", self.var_stoppzeit, 0.2, 2.0, 0.1,
+                     "hoeher = kurzes Zurueckziehen der Hand stoppt ihn nicht sofort "
+                     "(verzeiht Zittern und kurze Pausen)",
+                     "tiefer = er bleibt sofort stehen, sobald die Hand zurueckgeht")
+        self._regler(main, "Rueckwaerts-Tempo", self.var_rueck_v, 20, 200, 5,
+                     "hoeher = die Rueckwaertsfahrt nach Doppeltipp ist zuegiger",
+                     "tiefer = er setzt langsam und kontrolliert zurueck")
+        self._regler(main, "Rueckwaerts-Dauer (s)", self.var_rueck_t, 0.5, 5.0, 0.5,
+                     "hoeher = ein Doppeltipp bringt ihn weiter zurueck",
+                     "tiefer = kurzes Zuruecksetzen, dann wieder normale Steuerung")
 
         # ── Live-Anzeige ──────────────────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(12, 8))
@@ -2152,9 +2762,24 @@ class SteeringTuneWindow:
         ttk.Label(main, textvariable=self.tabelle_var, font=("Consolas", 10),
                   justify="left").pack(anchor="w", pady=(4, 0))
 
+        # ── Für die Testperson sichern ────────────────────────────────────────
+        # Ohne diese Möglichkeit stünden bei jedem Programmstart wieder die
+        # Vorgabewerte – eine Folgesitzung derselben Person wäre dann nicht mehr
+        # mit der vorherigen vergleichbar, weil unbemerkt anders gefahren wurde.
+        self._abschnitt(main, "Fuer diese Testperson sichern")
+        self.person_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.person_var, foreground="#555",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(0, 6))
+        ttk.Button(main, text="💾  Werte fuer diese Testperson speichern",
+                   command=self._fuer_person_speichern).pack(anchor="w")
+        self.speicher_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.speicher_var, foreground="#0a5",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(4, 0))
+
         # ── Übernahme ─────────────────────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(10, 8))
-        ttk.Label(main, text="Diese Zeilen oben in sphero_reha_main.py eintragen:",
+        ttk.Label(main, text="Als neue Vorgabe fuer ALLE: diese Zeilen oben in "
+                             "sphero_reha_main.py eintragen:",
                   font=("Segoe UI", 9)).pack(anchor="w")
         self.code_var = tk.StringVar(value="")
         ttk.Label(main, textvariable=self.code_var, font=("Consolas", 10),
@@ -2190,24 +2815,65 @@ class SteeringTuneWindow:
 
         tk.Scale(rahmen, from_=von, to=bis, resolution=schritt,
                  orient="horizontal", variable=variable, showvalue=False,
-                 length=560, command=lambda _v: self._uebernehmen()).pack(fill="x")
+                 length=560).pack(fill="x")
         ttk.Label(rahmen, text="▲  " + hoch, foreground="#a60",
                   wraplength=560, justify="left").pack(anchor="w")
         ttk.Label(rahmen, text="▼  " + tief, foreground="#06a",
                   wraplength=560, justify="left").pack(anchor="w")
 
+        # Anzeige UND Übernahme hängen an der Variablen, nicht am `command` des
+        # Reglers: Dessen Rückruf löst nur das Ziehen mit der Maus aus. Ein
+        # Fahrprofil, das die Variablen direkt setzt, bliebe damit wirkungslos.
         nachkomma = 2 if schritt < 1 else 0
-        variable.trace_add(
-            "write", lambda *_: wert.config(text=f"{variable.get():.{nachkomma}f}"))
+
+        def geaendert(*_):
+            wert.config(text=f"{variable.get():.{nachkomma}f}")
+            self._uebernehmen()
+
+        variable.trace_add("write", geaendert)
         wert.config(text=f"{variable.get():.{nachkomma}f}")
 
     # ── Wirkung ───────────────────────────────────────────────────────────────
 
-    def _uebernehmen(self):
-        """Reglerwerte in die Modulvariablen schreiben (wirkt sofort)."""
+    def _uebernehmen(self, profil: str = PROFIL_MANUELL):
+        """
+        Reglerwerte in die Modulvariablen schreiben (wirkt sofort).
+
+        `profil` ist der Name des zuletzt gewählten Fahrprofils; beim Ziehen
+        eines einzelnen Reglers ist die Einstellung keinem Profil mehr
+        zuzuordnen und wird deshalb als PROFIL_MANUELL geführt.
+        """
+        # Die Klemmung unten schreibt in eine Reglervariable zurück und löst
+        # damit erneut diese Methode aus. Ohne die Sperre entstünde daraus eine
+        # Endlosschleife.
+        if self._anwenden_laeuft:
+            return
+        self._anwenden_laeuft = True
+        try:
+            self._anwenden(profil)
+        finally:
+            self._anwenden_laeuft = False
+
+    def _anwenden(self, profil: str):
+        global MIN_SPEED_DYN, MAX_SPEED_DYN, GX_FULL_SPEED
         global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
         global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
         global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
+        global STOP_TIME, BACKWARD_SPEED, BACKWARD_DURATION
+        global fahrprofil_name
+
+        MIN_SPEED_DYN = int(round(float(self.var_tempo_min.get())))
+        MAX_SPEED_DYN = int(round(float(self.var_tempo_max.get())))
+        # Ein Grundtempo über dem Höchsttempo würde die Rampe in calc_speed()
+        # umkehren: Je stärker die Hand gesenkt wird, desto langsamer führe er.
+        # Der Regler wird auf den geklemmten Wert zurückgesetzt, damit Anzeige
+        # und tatsächliches Verhalten nicht auseinanderlaufen.
+        if MIN_SPEED_DYN > MAX_SPEED_DYN:
+            MIN_SPEED_DYN = MAX_SPEED_DYN
+            self.var_tempo_min.set(MIN_SPEED_DYN)
+
+        # Vollgas liegt bei gesenkter Hand, also im Negativen.
+        GX_FULL_SPEED         = -round(abs(float(self.var_vollgas.get())), 2)
         GY_LEFT_THRESHOLD     = round(abs(float(self.var_schwelle_l.get())), 3)
         MAX_TURN_ANGLE_LEFT   = int(round(float(self.var_winkel_l.get())))
         # rechts wird als negativer Wert geführt (Kippen in die Gegenrichtung)
@@ -2215,20 +2881,125 @@ class SteeringTuneWindow:
         MAX_TURN_ANGLE_RIGHT  = int(round(float(self.var_winkel_r.get())))
         TURN_SPEED_FACTOR     = round(float(self.var_tempo.get()), 2)
         ROLL_COMMAND_DURATION = round(float(self.var_zyklus.get()), 3)
+        STOP_TIME             = round(float(self.var_stoppzeit.get()), 2)
+        BACKWARD_SPEED        = int(round(float(self.var_rueck_v.get())))
+        BACKWARD_DURATION     = round(float(self.var_rueck_t.get()), 1)
+
+        fahrprofil_name = profil
+        self.profil_var.set(
+            "aktuell: von Hand eingestellt" if profil == PROFIL_MANUELL
+            else f"aktuell: Profil {profil}")
+        self._log_anstossen()
+
+    def _profil_anwenden(self, name: str):
+        """Fahrprofil auf die Regler legen; die Kippschwellen bleiben unberührt."""
+        werte = FAHRPROFILE.get(name)
+        if not werte:
+            return
+        # Höchsttempo zuerst: Wird das Grundtempo zuerst angehoben, während das
+        # alte, niedrigere Höchsttempo noch steht, klemmt _anwenden() es auf
+        # diesen alten Wert – das Profil käme dann zu langsam heraus.
+        self.var_tempo_max.set(werte["MAX_SPEED_DYN"])
+        self.var_tempo_min.set(werte["MIN_SPEED_DYN"])
+        self.var_tempo.set(werte["TURN_SPEED_FACTOR"])
+        self.var_winkel_l.set(werte["MAX_TURN_ANGLE_LEFT"])
+        self.var_winkel_r.set(werte["MAX_TURN_ANGLE_RIGHT"])
+        self.var_zyklus.set(werte["ROLL_COMMAND_DURATION"])
+        self.var_stoppzeit.set(werte["STOP_TIME"])
+        self.var_rueck_v.set(werte["BACKWARD_SPEED"])
+        self._uebernehmen(profil=name)
+        set_status(f"Fahrprofil „{name}“ übernommen.")
+
+    # ── Nachvollziehbarkeit ───────────────────────────────────────────────────
+
+    def _log_anstossen(self):
+        """
+        Protokollierung anstoßen, aber erst nachdem der Regler zur Ruhe kam.
+
+        Ein tk.Scale feuert während des Ziehens laufend; ohne diese Verzögerung
+        entstünde für eine einzige Reglerbewegung eine lange Kette von
+        Zwischenwerten in events.csv.
+        """
+        if self._log_job is not None:
+            try:
+                self.win.after_cancel(self._log_job)
+            except Exception:
+                pass
+        self._log_job = self.win.after(self.LOG_DEBOUNCE_MS, self._log_changes)
+
+    def _log_changes(self):
+        self._log_job = None
+        jetzt = fahrverhalten_werte()
+        geaendert = [f"{name}: {self._geloggt[name]} -> {wert}"
+                     for name, wert in jetzt.items()
+                     if self._geloggt.get(name) != wert]
+        if not geaendert:
+            return
+        self._geloggt = jetzt
+        recorder.log_event("fahrverhalten_geaendert",
+                           f"profil={fahrprofil_name}; " + "; ".join(geaendert))
+
+    def regler_nachfuehren(self):
+        """
+        Regler auf den aktuellen Stand der Modulvariablen bringen.
+
+        Nötig, wenn die Werte von außen gesetzt wurden – beim Laden der für eine
+        Testperson gespeicherten Einstellung. Ohne das zeigten die Regler noch
+        die alten Positionen, und die nächste Reglerbewegung schriebe den
+        veralteten Stand aller übrigen Größen zurück.
+        """
+        if self._anwenden_laeuft:
+            return
+        self._anwenden_laeuft = True
+        try:
+            self.var_tempo_min.set(MIN_SPEED_DYN)
+            self.var_tempo_max.set(MAX_SPEED_DYN)
+            self.var_vollgas.set(abs(GX_FULL_SPEED))
+            self.var_schwelle_l.set(abs(GY_LEFT_THRESHOLD))
+            self.var_winkel_l.set(MAX_TURN_ANGLE_LEFT)
+            self.var_schwelle_r.set(abs(GY_RIGHT_THRESHOLD))
+            self.var_winkel_r.set(MAX_TURN_ANGLE_RIGHT)
+            self.var_tempo.set(TURN_SPEED_FACTOR)
+            self.var_zyklus.set(ROLL_COMMAND_DURATION)
+            self.var_stoppzeit.set(STOP_TIME)
+            self.var_rueck_v.set(BACKWARD_SPEED)
+            self.var_rueck_t.set(BACKWARD_DURATION)
+            self.profil_var.set(
+                "aktuell: von Hand eingestellt" if fahrprofil_name == PROFIL_MANUELL
+                else f"aktuell: Profil {fahrprofil_name}")
+        finally:
+            self._anwenden_laeuft = False
+        self._geloggt = fahrverhalten_werte()
+        self.person_var.set(self._person_text())
+
+    def _fuer_person_speichern(self):
+        if self._speichern_cb is None:
+            self.speicher_var.set("Speichern ist hier nicht verfügbar.")
+            return
+        try:
+            self.speicher_var.set(self._speichern_cb())
+        except Exception as e:
+            self.speicher_var.set(f"Konnte nicht gespeichert werden: {e}")
 
     def _reset_max(self):
         self._max_links = self._max_rechts = 0.0
 
     def _werte_text(self) -> str:
-        return (f"GY_LEFT_THRESHOLD     = {GY_LEFT_THRESHOLD:+.2f}\n"
+        return (f"MIN_SPEED_DYN         = {MIN_SPEED_DYN}\n"
+                f"MAX_SPEED_DYN         = {MAX_SPEED_DYN}\n"
+                f"GX_FULL_SPEED         = {GX_FULL_SPEED:+.2f}\n"
+                f"GY_LEFT_THRESHOLD     = {GY_LEFT_THRESHOLD:+.2f}\n"
                 f"MAX_TURN_ANGLE_LEFT   = {MAX_TURN_ANGLE_LEFT}\n"
                 f"GY_RIGHT_THRESHOLD    = {GY_RIGHT_THRESHOLD:+.2f}\n"
                 f"MAX_TURN_ANGLE_RIGHT  = {MAX_TURN_ANGLE_RIGHT}\n"
                 f"TURN_SPEED_FACTOR     = {TURN_SPEED_FACTOR}\n"
-                f"ROLL_COMMAND_DURATION = {ROLL_COMMAND_DURATION}")
+                f"ROLL_COMMAND_DURATION = {ROLL_COMMAND_DURATION}\n"
+                f"STOP_TIME             = {STOP_TIME}\n"
+                f"BACKWARD_SPEED        = {BACKWARD_SPEED}\n"
+                f"BACKWARD_DURATION     = {BACKWARD_DURATION}")
 
     def _print_werte(self):
-        print("[LENKUNG] " + self._werte_text().replace("\n", "   "))
+        print("[FAHRVERHALTEN] " + self._werte_text().replace("\n", "   "))
 
     # ── Laufende Anzeige ──────────────────────────────────────────────────────
 
@@ -2262,7 +3033,9 @@ class SteeringTuneWindow:
         self.live_var.set(
             f"gY jetzt : {gy:+.2f}  ->  {richtung:9s} {winkel:5.1f} Grad je Schritt "
             f"= {winkel / zyklus:6.0f} Grad/s\n"
-            f"gX jetzt : {gx:+.2f}  ->  Tempo {tempo:3d}\n"
+            f"gX jetzt : {gx:+.2f}  ->  Tempo {tempo:3d}   "
+            f"(Bereich {MIN_SPEED_DYN}...{MAX_SPEED_DYN}, "
+            f"Vollgas ab gX {GX_FULL_SPEED:+.2f})\n"
             f"groesster Ausschlag   links {self._max_links:+.2f}   "
             f"rechts {self._max_rechts:+.2f}\n"
             f"Zykluszeit {zyklus*1000:.0f} ms  =  {1/zyklus:.1f} Lenkschritte/s, "
@@ -2279,6 +3052,9 @@ class SteeringTuneWindow:
                           f"|{re:6.1f} {re/zyklus:7.0f}")
         self.tabelle_var.set("\n".join(zeilen))
         self.code_var.set(self._werte_text())
+        # Laufend nachziehen: Die Testperson kann im Hauptfenster gewechselt
+        # werden, während dieses Fenster offen steht.
+        self.person_var.set(self._person_text())
 
     def close(self):
         self._running = False
@@ -2344,6 +3120,19 @@ def show_controller_ui():
               font=("Consolas", 9), foreground="#555",
               wraplength=440, justify="left").pack(anchor="w", pady=(8, 0))
 
+    # ── Herzfrequenzzonen der gewählten Person ────────────────────────────────
+    # Die Zonen stehen sichtbar im Hauptfenster, weil sie die Sicherheitsgrenze
+    # der Sitzung sind: Die betreuende Person muss ohne Umweg über ein
+    # Untermenü sehen, ab wann die Anzeige orange bzw. rot wird und worauf
+    # dieser Wert beruht.
+    hr_zone_var = tk.StringVar(value="Herzfrequenzzonen: Standardwerte (100 / 120 BPM)")
+    ttk.Label(person_frame, textvariable=hr_zone_var,
+              font=("Consolas", 9), foreground="#a05000",
+              wraplength=440, justify="left").pack(anchor="w", pady=(8, 0))
+
+    ruhepuls_button = ttk.Button(person_frame, text="❤  Ruhepuls messen")
+    ruhepuls_button.pack(anchor="w", pady=(6, 0))
+
     video_check = ttk.Checkbutton(
         person_frame, variable=video_consent_var,
         text="Videoaufzeichnung dieser Sitzung (freiwillig)")
@@ -2355,6 +3144,55 @@ def show_controller_ui():
         if selected_pid[0] in ids:
             participant_var.set(registry.label(selected_pid[0]))
 
+    def hr_zone_anzeige_aktualisieren(record):
+        """Zonen neu berechnen und anzeigen; ohne Person auf Vorgabe zurück."""
+        setze_hr_zonen(record)
+        if not record:
+            hr_zone_var.set(
+                f"Herzfrequenzzonen: Standardwerte "
+                f"({HR_WARN_DEFAULT} / {HR_DANGER_DEFAULT} BPM) – "
+                f"keine Testperson gewählt")
+            ruhepuls_button.config(state="disabled")
+            return
+        ruhepuls_button.config(state="normal")
+        ruhe = record.get("resting_hr_bpm")
+        if valid_hr(ruhe):
+            hr_zone_var.set(
+                f"Herzfrequenz: Warnung ab {HR_WARN} BPM, Gefahr ab {HR_DANGER} BPM\n"
+                f"(Alter {record['age_years']} J., Ruhepuls {int(ruhe)} BPM, "
+                f"HFmax {hr_max_tanaka(record['age_years']):.0f}, Karvonen)")
+        else:
+            hr_zone_var.set(
+                f"Herzfrequenz: Warnung ab {HR_WARN} BPM, Gefahr ab {HR_DANGER} BPM\n"
+                f"⚠ Ruhepuls fehlt – Ersatzrechnung über HFmax. "
+                f"Für genauere Zonen bitte Ruhepuls messen.")
+
+    def fahrwerte_laden(record):
+        """
+        Die für diese Person gespeicherten Fahrwerte übernehmen.
+
+        Ist noch nichts gespeichert, bleibt die aktuelle Einstellung stehen –
+        sie ist als Ausgangspunkt brauchbarer als ein Rücksprung auf die
+        Vorgabe, denn beim Anlegen einer neuen Person wurde meist gerade erst
+        passend eingestellt.
+        """
+        if not record:
+            return None
+        gespeichert = record.get("fahrverhalten")
+        if not gespeichert:
+            return None
+        werte  = gespeichert.get("werte", {})
+        profil = gespeichert.get("profil")
+        geaendert = fahrverhalten_anwenden(werte, profil=profil)
+        tw = tune_window_ref[0]
+        if tw is not None and tw.win.winfo_exists():
+            tw.regler_nachfuehren()
+        recorder.log_event(
+            "fahrverhalten_geladen",
+            f"Testperson {record.get('participant_id')}; profil={fahrprofil_name}; "
+            f"{len(geaendert)} Werte geaendert")
+        return gespeichert.get("gespeichert_iso")
+
     def apply_selection(pid):
         selected_pid[0] = pid
         record = registry.get(pid) if pid else None
@@ -2362,7 +3200,10 @@ def show_controller_ui():
             participant_info_var.set("Keine Testperson ausgewählt.")
             video_consent_var.set(False)
             video_check.config(state="disabled")
+            hr_zone_anzeige_aktualisieren(None)
             return
+        hr_zone_anzeige_aktualisieren(record)
+        geladen_am = fahrwerte_laden(record)
         allowed = record.get("consent", {}).get("video", False)
         video_check.config(state="normal" if allowed else "disabled")
         # Standard = das, was die Person bei der Aufnahme zugestimmt hat.
@@ -2372,18 +3213,63 @@ def show_controller_ui():
                      if record.get("parq_any_yes") else "PAR-Q: unauffällig")
         video_hint = ("Video: eingewilligt" if allowed
                       else "Video: NICHT eingewilligt – keine Videoaufnahme möglich")
+        fahr_hint = (f"Fahrwerte geladen (gespeichert {geladen_am[:16].replace('T', ' ')})"
+                     if geladen_am else "Fahrwerte: noch keine gespeichert")
         participant_info_var.set(
             f"{record['age_years']} J. (Gruppe {record['age_group']}) | "
             f"{record['sex']} | {record['handedness']} | "
             f"Technikaffinität {record['tech_affinity']}/5\n"
-            f"{parq_hint}  |  {video_hint}"
+            f"{parq_hint}  |  {video_hint}\n"
+            f"{fahr_hint}"
         )
+
+    def ruhepuls_messen():
+        pid = selected_pid[0]
+        record = registry.get(pid) if pid else None
+        if not record:
+            messagebox.showinfo(
+                "Keine Testperson gewählt",
+                "Bitte zuerst eine Testperson auswählen oder anlegen.")
+            return
+
+        def uebernehmen(bpm):
+            registry.update(pid,
+                            resting_hr_bpm=int(bpm),
+                            resting_hr_measured_iso=datetime.now().isoformat(
+                                timespec="seconds"))
+            # Zonen sofort neu rechnen, damit die Anzeige und die
+            # Graphen-Schwellen ab jetzt mit dem gemessenen Wert arbeiten.
+            hr_zone_anzeige_aktualisieren(registry.get(pid))
+            set_status(f"Ruhepuls {int(bpm)} BPM gespeichert – "
+                       f"Zonen jetzt {HR_WARN}/{HR_DANGER} BPM.")
+
+        RuhepulsFenster(root, pid, record["age_years"], fertig=uebernehmen)
+
+    def ruhepuls_nachfragen(pid):
+        """
+        Nach fehlendem Ruhepuls fragen, statt ihn stillschweigend zu ersetzen.
+
+        Ohne Nachfrage würde die Ersatzrechnung über HFmax unbemerkt greifen –
+        die Sitzung liefe mit gröberen Zonen, ohne dass es jemandem auffällt.
+        """
+        record = registry.get(pid)
+        if not record or valid_hr(record.get("resting_hr_bpm")):
+            return
+        if messagebox.askyesno(
+                "Ruhepuls noch nicht gemessen",
+                f"Für {pid} liegt noch kein Ruhepuls vor.\n\n"
+                "Ohne ihn werden die Herzfrequenzzonen nur grob über die "
+                "maximale Herzfrequenz geschätzt. Die Messung dauert eine "
+                "Minute im Sitzen.\n\n"
+                "Jetzt messen?"):
+            ruhepuls_messen()
 
     def on_person_selected(_event=None):
         label = participant_var.get()
         for pid in registry.ids():
             if registry.label(pid) == label:
                 apply_selection(pid)
+                ruhepuls_nachfragen(pid)
                 return
 
     def new_person_clicked():
@@ -2398,9 +3284,14 @@ def show_controller_ui():
             participant_var.set(registry.label(pid))
             apply_selection(pid)
             set_status(f"Testperson {pid} angelegt und ausgewählt.")
+            # Direkt nach dem Anlegen ist der richtige Zeitpunkt: Die Person
+            # sitzt noch, bevor die Übung beginnt – später wäre der Puls durch
+            # die Bewegung erhöht und als Ruhepuls unbrauchbar.
+            ruhepuls_nachfragen(pid)
 
     person_box.bind("<<ComboboxSelected>>", on_person_selected)
     new_person_button.config(command=new_person_clicked)
+    ruhepuls_button.config(command=ruhepuls_messen)
     refresh_person_box()
     apply_selection(None)
 
@@ -2412,9 +3303,10 @@ def show_controller_ui():
     stop_button   = ttk.Button(buttons, text="■  Sphero stoppen")
     graph_button  = ttk.Button(buttons, text="📊  Live Graphen")
     camera_button = ttk.Button(buttons, text="📷  Kamera starten")
-    # Temporäres Werkzeug: kann samt SteeringTuneWindow entfernt werden,
-    # sobald die Lenkwerte feststehen.
-    tune_button   = ttk.Button(buttons, text="🎛  Lenkung justieren")
+    # Tempo, Lenkung, Anhalten und Rückwärtsfahrt – die Anpassung der Steuerung
+    # an die einzelne Testperson. Bewusst ein eigenes Fenster: Während der Fahrt
+    # wird hier nachjustiert, das Hauptfenster soll dabei sichtbar bleiben.
+    tune_button   = ttk.Button(buttons, text="🎛  Fahrverhalten justieren")
     record_button = ttk.Button(buttons, text="⏺  Aufzeichnung starten")
 
     start_button.grid( row=0, column=0, sticky="ew", padx=(0, 6), pady=3)
@@ -2610,13 +3502,49 @@ def show_controller_ui():
             start_server_once()
             graph_window_ref[0] = LiveGraphWindow(root)
 
+    def fahrwerte_speichern() -> str:
+        """
+        Aktuelle Fahrwerte bei der gewählten Testperson ablegen.
+
+        Rückgabe ist der Text, den das Einstellfenster anzeigt.
+        """
+        pid = selected_pid[0]
+        if not pid:
+            return "Keine Testperson gewählt – bitte im Hauptfenster auswählen."
+        gespeichert_iso = datetime.now().isoformat(timespec="seconds")
+        registry.update(pid, fahrverhalten={
+            "profil":           fahrprofil_name,
+            "werte":            fahrverhalten_werte(),
+            "gespeichert_iso":  gespeichert_iso,
+        })
+        recorder.log_event("fahrverhalten_gespeichert",
+                           f"Testperson {pid}; profil={fahrprofil_name}")
+        set_status(f"Fahrwerte für {pid} gespeichert.")
+        apply_selection(pid)      # Hinweiszeile im Hauptfenster nachziehen
+        return (f"Gespeichert für {pid} um "
+                f"{gespeichert_iso[11:16]} Uhr. Wird beim nächsten Auswählen "
+                f"dieser Testperson automatisch geladen.")
+
+    def person_beschreibung() -> str:
+        pid = selected_pid[0]
+        if not pid:
+            return ("Keine Testperson gewählt. Die Werte gelten nur für diesen "
+                    "Programmlauf und gehen beim Beenden verloren.")
+        record = registry.get(pid) or {}
+        gespeichert = (record.get("fahrverhalten") or {}).get("gespeichert_iso")
+        if gespeichert:
+            return (f"Gewählt: {pid}. Zuletzt gespeichert am "
+                    f"{gespeichert[:16].replace('T', ' ')} Uhr.")
+        return f"Gewählt: {pid}. Für diese Testperson ist noch nichts gespeichert."
+
     def toggle_tuning():
         tw = tune_window_ref[0]
         if tw is not None and tw.win.winfo_exists():
             tw.close()
         else:
             start_server_once()
-            tune_window_ref[0] = SteeringTuneWindow(root)
+            tune_window_ref[0] = DrivingTuneWindow(
+                root, speichern=fahrwerte_speichern, person_text=person_beschreibung)
 
     def toggle_camera():
         cam = camera_thread_ref[0]
