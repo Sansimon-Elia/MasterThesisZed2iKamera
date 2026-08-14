@@ -990,6 +990,21 @@ _CSV_SCHEMAS = {
                       "elbow_left_deg", "elbow_right_deg"],
     "events":       ["t_rel_s", "t_abs_s", "timestamp", "event", "detail"],
     "video_frames": ["frame_index", "t_rel_s", "t_abs_s", "timestamp"],
+    # Ein Datensatz je gefahrenem Aufgabendurchgang – die auswertbare
+    # Zielgröße der Studie. Bewusst als eigene, flache Tabelle: So lässt sich
+    # ohne Vorverarbeitung über alle Sitzungen hinweg vergleichen, während
+    # sensor/control die Rohdaten für die Detailanalyse bereithalten.
+    #
+    # gueltig=0 heißt: Durchgang wurde als ungültig markiert (Abbruch, Störung).
+    # Solche Zeilen werden NICHT gelöscht, sondern bleiben mit Begründung
+    # stehen – nachträgliches Entfernen misslungener Versuche wäre eine
+    # Verzerrung der Stichprobe.
+    # abstand_m: Abstand der beiden Bodenmarkierungen. Steht in JEDER Zeile,
+    # damit Zeiten aus verschiedenen Aufbauten nie stillschweigend in einen
+    # Topf geraten – eine Sekunde auf 1 m Strecke ist etwas anderes als auf 2 m.
+    "aufgaben":     ["versuch", "abstand_m", "t_rel_start_s", "t_rel_ende_s",
+                      "dauer_s", "zwischenzeiten_s", "halte", "lenkwechsel",
+                      "rueckwaerts", "hr_mittel", "hr_max", "gueltig", "notiz"],
 }
 
 
@@ -1140,6 +1155,18 @@ class SessionRecorder:
 
     # ── Logging-Methoden (threadsicher) ──────────────────────────────────────
 
+    def t_rel(self, t_abs=None) -> float:
+        """
+        Sitzungszeit (0 = Aufnahmebeginn) zu einem absoluten Zeitpunkt.
+
+        Für Auswertungen, die ihre Zeitpunkte selbst nehmen – etwa der
+        Aufgaben-Timer – und sie trotzdem auf dieselbe Achse legen müssen wie
+        alle aufgezeichneten Zeilen.
+        """
+        if t_abs is None:
+            t_abs = clock.t_abs()
+        return t_abs - self._t_offset
+
     def _now(self):
         """
         Ein einziger Uhrenzugriff pro Datenzeile – daraus werden alle drei
@@ -1229,6 +1256,22 @@ class SessionRecorder:
                     elev_left if elev_left is not None else float("nan"))
                 self._plot["angle_right"].append(
                     elev_right if elev_right is not None else float("nan"))
+
+    def log_aufgabe(self, zeile: dict):
+        """
+        Einen abgeschlossenen Aufgabendurchgang festhalten.
+
+        Erwartet die Spalten aus _CSV_SCHEMAS["aufgaben"]; fehlende bleiben leer.
+        """
+        if not self.active:
+            return
+        with self._lock:
+            if not self.active or "aufgaben" not in self._writers:
+                return
+            self._writers["aufgaben"].writerow(
+                [zeile.get(spalte, "") for spalte in _CSV_SCHEMAS["aufgaben"]])
+            self._files["aufgaben"].flush()
+            self._counts["aufgaben"] += 1
 
     def log_event(self, event: str, detail: str = ""):
         if not self.active:
@@ -2780,6 +2823,407 @@ class LiveGraphWindow:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Standardaufgabe: Zwei-Markierungen-Parcours
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Wortlaut, der jeder Testperson VORGELESEN wird. Bewusst als fester Text und
+# nicht als freie Erklärung: Unterschiedlich formulierte Anweisungen sind eine
+# der häufigsten Fehlerquellen in Bewegungsstudien, weil schon ein "möglichst
+# schnell" gegenüber "in Ruhe" die Strategie und damit die Messgröße verändert.
+#
+# Die Formulierung vermeidet deshalb eine Aufforderung zur Eile: Gemessen wird
+# die Zeit, aber die Person soll nicht auf Tempo optimieren, sondern die Aufgabe
+# sauber lösen. Sonst misst man Risikobereitschaft statt Steuerfähigkeit – und
+# die unterscheidet sich zwischen Altersgruppen systematisch.
+AUFGABE_ANLEITUNG = (
+    "Vor Ihnen liegen zwei Markierungen auf dem Boden.\n"
+    "\n"
+    "Ihre Aufgabe:\n"
+    "  1.  Fahren Sie den Ball von der ersten zur zweiten Markierung.\n"
+    "  2.  Umrunden Sie die zweite Markierung einmal vollständig.\n"
+    "  3.  Fahren Sie zurück zur ersten Markierung.\n"
+    "  4.  Umrunden Sie auch diese einmal vollständig.\n"
+    "\n"
+    "Danach ist der Durchgang beendet.\n"
+    "\n"
+    "Nehmen Sie sich die Zeit, die Sie brauchen. Es geht nicht darum, schnell "
+    "zu sein, sondern darum, den Ball sicher zu führen. Wenn etwas nicht "
+    "klappt, fahren Sie einfach weiter."
+)
+
+AUFGABE_NAME = "Zwei-Markierungen-Parcours"
+
+
+class AufgabeFenster:
+    """
+    Durchführung und Zeitnahme der Standardaufgabe.
+
+    Warum es die Aufgabe überhaupt braucht: Freies Fahren liefert reichhaltige
+    Rohdaten, aber keine Zielgröße. Erst eine für alle gleiche Aufgabe macht
+    Sitzungen und Altersgruppen vergleichbar. Die Zeit ist dabei die
+    Hauptmessgröße; die übrigen Kennzahlen entstehen nebenbei aus dem
+    Fahrzustand und kosten die betreuende Person keinen zusätzlichen Handgriff.
+
+    Mehrere Durchgänge je Sitzung sind vorgesehen und ausdrücklich erwünscht:
+    Ein einzelner Versuch ist stark von Zufall und Eingewöhnung geprägt. Üblich
+    ist, den ersten Durchgang als Übungsversuch zu werten und erst die
+    folgenden auszuwerten – deshalb wird jeder Durchgang nummeriert, statt nur
+    eine Bestzeit zu behalten.
+
+    Misslungene Durchgänge werden als ungültig MARKIERT, nicht gelöscht. Wer
+    Fehlversuche verschwinden lässt, verzerrt die Stichprobe.
+    """
+
+    TAKT_MS = 100    # Abtastung des Fahrzustands für die Nebenkennzahlen
+
+    def __init__(self, parent, teilnehmer_text):
+        self.win = tk.Toplevel(parent)
+        self.win.title("Standardaufgabe")
+        self.win.geometry("640x780")
+        self.win.minsize(560, 560)
+        self.win.transient(parent)
+
+        self._teilnehmer_text = teilnehmer_text
+        self._laeuft      = False
+        self._job         = None
+        self._versuch     = 0
+        self._ergebnisse  = []
+
+        scroll = probanden._ScrollFrame(self.win, height=620)
+        scroll.pack(fill="both", expand=True, padx=14, pady=(12, 0))
+        self._scroll = scroll
+        main = scroll.inner
+
+        ttk.Label(main, text=AUFGABE_NAME,
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        self.person_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.person_var, foreground="#555",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(2, 8))
+
+        # ── Skizze des Parcours ───────────────────────────────────────────────
+        self._zeichne_parcours(main)
+
+        # ── Aufbau ────────────────────────────────────────────────────────────
+        # Der Abstand wandert in jede Ergebniszeile: Zeiten sind nur innerhalb
+        # desselben Aufbaus vergleichbar, und "wir hatten doch immer 1 m" ist
+        # nach Monaten keine belastbare Auskunft mehr.
+        aufbau = ttk.Frame(main)
+        aufbau.pack(fill="x", pady=(8, 0))
+        ttk.Label(aufbau, text="Abstand der Markierungen (m):",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.var_abstand = tk.StringVar(value="1.0")
+        ttk.Entry(aufbau, textvariable=self.var_abstand,
+                  width=6, justify="center").pack(side="left", padx=(8, 0))
+        ttk.Label(main,
+                  text="Muss über die GESAMTE Studie gleich bleiben – sonst sind die "
+                       "Zeiten zwischen den Testpersonen nicht vergleichbar. Wird mit "
+                       "jedem Durchgang gespeichert.",
+                  foreground="#777", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+
+        # ── Anleitung zum Vorlesen ────────────────────────────────────────────
+        ttk.Separator(main).pack(fill="x", pady=(12, 8))
+        ttk.Label(main, text="Diesen Text der Testperson vorlesen:",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(main,
+                  text="Wortlaut bitte nicht abwandeln – unterschiedlich "
+                       "formulierte Anweisungen verändern die Strategie und damit "
+                       "die gemessene Zeit.",
+                  foreground="#777", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        anleitung = tk.Text(main, height=13, wrap="word", relief="solid",
+                            borderwidth=1, font=("Segoe UI", 10))
+        anleitung.insert("1.0", AUFGABE_ANLEITUNG)
+        anleitung.config(state="disabled")
+        anleitung.pack(fill="x")
+
+        # ── Zeitnahme ─────────────────────────────────────────────────────────
+        ttk.Separator(main).pack(fill="x", pady=(12, 8))
+        ttk.Label(main, text="Zeitnahme",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(main,
+                  text="Empfohlener Ablauf: 3 Durchgänge direkt hintereinander, mit "
+                       "derselben vorgelesenen Anweisung. Durchgang 1 ist der "
+                       "Übungsdurchgang und wird bei der Auswertung ausgeschlossen "
+                       "(gespeichert wird er trotzdem); gewertet wird der Mittelwert "
+                       "der Durchgänge 2 und 3.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(2, 4))
+
+        self.zeit_var = tk.StringVar(value="0.0 s")
+        ttk.Label(main, textvariable=self.zeit_var,
+                  font=("Consolas", 34, "bold"),
+                  foreground="#06c").pack(anchor="w", pady=(4, 2))
+
+        self.status_var = tk.StringVar(value="Bereit für Durchgang 1.")
+        ttk.Label(main, textvariable=self.status_var, wraplength=560,
+                  justify="left").pack(anchor="w")
+
+        self.zwischen_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.zwischen_var, font=("Consolas", 9),
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+
+        knoepfe = ttk.Frame(main)
+        knoepfe.pack(fill="x", pady=(10, 0))
+        self.start_button = ttk.Button(knoepfe, text="▶  Aufgabe starten",
+                                       command=self._umschalten)
+        self.start_button.pack(side="left")
+        self.zwischen_button = ttk.Button(knoepfe, text="⏱  Zwischenzeit",
+                                          command=self._zwischenzeit,
+                                          state="disabled")
+        self.zwischen_button.pack(side="left", padx=(8, 0))
+        self.verwerfen_button = ttk.Button(knoepfe, text="✖  Durchgang verwerfen",
+                                           command=self._verwerfen,
+                                           state="disabled")
+        self.verwerfen_button.pack(side="left", padx=(8, 0))
+
+        ttk.Label(main,
+                  text="Zwischenzeit ist freiwillig – etwa nach jeder der vier "
+                       "Teilstrecken. Sie unterbricht die Messung nicht.",
+                  foreground="#777", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(6, 0))
+
+        # ── Ergebnisse dieser Sitzung ─────────────────────────────────────────
+        ttk.Separator(main).pack(fill="x", pady=(12, 8))
+        ttk.Label(main, text="Durchgänge dieser Sitzung",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self.tabelle_var = tk.StringVar(value="noch keine")
+        ttk.Label(main, textvariable=self.tabelle_var, font=("Consolas", 10),
+                  justify="left").pack(anchor="w", pady=(4, 8))
+
+        fuss = ttk.Frame(self.win, padding=(14, 8))
+        fuss.pack(fill="x")
+        ttk.Button(fuss, text="Schliessen", command=self.close).pack(side="right")
+
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self._anzeige_auffrischen()
+
+    # ── Skizze ────────────────────────────────────────────────────────────────
+
+    def _zeichne_parcours(self, parent):
+        """
+        Schematische Darstellung statt Foto.
+
+        Eine Zeichnung zeigt genau das, worauf es ankommt – Reihenfolge und
+        Umrundungsrichtung – und bleibt richtig, egal wie der Raum aussieht.
+        Ein Foto einer fremden Umgebung würde dagegen Details zeigen, die mit
+        dem eigenen Aufbau nichts zu tun haben.
+        """
+        c = tk.Canvas(parent, width=560, height=210, background="white",
+                      highlightthickness=1, highlightbackground="#ccc")
+        c.pack(anchor="w", pady=(4, 0))
+
+        a = (150, 105)
+        b = (410, 105)
+        r_mark = 20
+        r_bahn = 48
+
+        # Markierungen
+        for (x, y), name in ((a, "1"), (b, "2")):
+            c.create_oval(x - r_mark, y - r_mark, x + r_mark, y + r_mark,
+                          fill="#ffd9a0", outline="#c07000", width=2)
+            c.create_text(x, y, text=name, font=("Segoe UI", 13, "bold"),
+                          fill="#7a4400")
+
+        # Hinweg oben, Rückweg unten – räumlich getrennt, damit die Richtung
+        # der Umrundung erkennbar bleibt.
+        c.create_line(a[0] + 30, a[1] - 42, b[0] - 30, b[1] - 42,
+                      arrow="last", width=3, fill="#0a7", smooth=True)
+        c.create_text((a[0] + b[0]) / 2, a[1] - 56, text="① hinfahren",
+                      font=("Segoe UI", 9, "bold"), fill="#0a7")
+
+        c.create_arc(b[0] - r_bahn, b[1] - r_bahn, b[0] + r_bahn, b[1] + r_bahn,
+                     start=100, extent=-290, style="arc", width=3, outline="#c60")
+        c.create_text(b[0] + r_bahn + 34, b[1], text="② umrunden",
+                      font=("Segoe UI", 9, "bold"), fill="#c60")
+
+        c.create_line(b[0] - 30, b[1] + 42, a[0] + 30, a[1] + 42,
+                      arrow="last", width=3, fill="#06c", smooth=True)
+        c.create_text((a[0] + b[0]) / 2, a[1] + 56, text="③ zurueckfahren",
+                      font=("Segoe UI", 9, "bold"), fill="#06c")
+
+        c.create_arc(a[0] - r_bahn, a[1] - r_bahn, a[0] + r_bahn, a[1] + r_bahn,
+                     start=80, extent=290, style="arc", width=3, outline="#c60")
+        c.create_text(a[0] - r_bahn - 34, a[1], text="④ umrunden",
+                      font=("Segoe UI", 9, "bold"), fill="#c60")
+
+    # ── Ablauf ────────────────────────────────────────────────────────────────
+
+    def _abstand_m(self) -> str:
+        """
+        Eingetragener Markierungsabstand als Zahltext, "" wenn unlesbar.
+
+        Deutsche Tastaturen liefern gern ein Komma – das wird akzeptiert.
+        Unlesbares wird nicht verworfen, sondern als leeres Feld gespeichert
+        und fällt so in der Auswertung sofort auf.
+        """
+        try:
+            return f"{float(self.var_abstand.get().strip().replace(',', '.')):.2f}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _umschalten(self):
+        if self._laeuft:
+            self._beenden(gueltig=True)
+        else:
+            self._starten()
+
+    def _starten(self):
+        start_server_once()
+        self._versuch += 1
+        self._laeuft   = True
+        self._t_start  = clock.t_abs()
+        self._zwischen = []
+
+        # Nebenkennzahlen: Zustand beim Start als Bezug, dann Wechsel zählen.
+        with data_lock:
+            self._letzter_zustand = latest_data["state"]
+            self._letztes_backward = latest_data["backward_until"]
+        self._halte = 0
+        self._lenkwechsel = 0
+        self._rueckwaerts = 0
+        self._hr = []
+
+        self.start_button.config(text="■  Aufgabe beenden")
+        self.zwischen_button.config(state="normal")
+        self.verwerfen_button.config(state="normal")
+        self.zwischen_var.set("")
+        hinweis = ("" if recorder.active else
+                   "   ACHTUNG: keine Aufzeichnung aktiv – dieser Durchgang "
+                   "wird NICHT gespeichert.")
+        self.status_var.set(f"Durchgang {self._versuch} läuft.{hinweis}")
+        recorder.log_event("aufgabe_start",
+                           f"{AUFGABE_NAME}; Durchgang {self._versuch}; "
+                           f"Abstand {self._abstand_m() or '?'} m")
+        self._tick()
+
+    def _tick(self):
+        if not self._laeuft:
+            return
+        verstrichen = clock.t_abs() - self._t_start
+        self.zeit_var.set(f"{verstrichen:.1f} s")
+
+        with data_lock:
+            zustand  = latest_data["state"]
+            backward = latest_data["backward_until"]
+            hr       = latest_data["heart_rate"]
+
+        # Halt = Übergang von einer Fahrbewegung in die Neutrallage.
+        if zustand != self._letzter_zustand:
+            if zustand == "neutral":
+                self._halte += 1
+            elif zustand in ("left", "right"):
+                self._lenkwechsel += 1
+            self._letzter_zustand = zustand
+
+        # Jede Verlängerung des Rückwärtsfensters ist ein neuer Doppeltipp.
+        if backward > self._letztes_backward:
+            self._rueckwaerts += 1
+        self._letztes_backward = backward
+
+        if valid_hr(hr):
+            self._hr.append(float(hr))
+
+        self._job = self.win.after(self.TAKT_MS, self._tick)
+
+    def _zwischenzeit(self):
+        if not self._laeuft:
+            return
+        t = clock.t_abs() - self._t_start
+        self._zwischen.append(round(t, 1))
+        self.zwischen_var.set("Zwischenzeiten: "
+                              + "  ".join(f"{z:.1f}s" for z in self._zwischen))
+        recorder.log_event("aufgabe_zwischenzeit",
+                           f"Durchgang {self._versuch}; {t:.1f} s")
+
+    def _verwerfen(self):
+        if not self._laeuft:
+            return
+        notiz = "verworfen (waehrend des Durchgangs abgebrochen)"
+        self._beenden(gueltig=False, notiz=notiz)
+
+    def _beenden(self, gueltig: bool, notiz: str = ""):
+        self._laeuft = False
+        if self._job is not None:
+            try:
+                self.win.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+        t_ende  = clock.t_abs()
+        dauer   = t_ende - self._t_start
+        hr_mit  = round(sum(self._hr) / len(self._hr), 1) if self._hr else ""
+        hr_max  = round(max(self._hr), 1) if self._hr else ""
+
+        zeile = {
+            "versuch":          self._versuch,
+            "abstand_m":        self._abstand_m(),
+            "t_rel_start_s":    f"{recorder.t_rel(self._t_start):.3f}" if recorder.active else "",
+            "t_rel_ende_s":     f"{recorder.t_rel(t_ende):.3f}" if recorder.active else "",
+            "dauer_s":          f"{dauer:.2f}",
+            "zwischenzeiten_s": " ".join(f"{z:.1f}" for z in self._zwischen),
+            "halte":            self._halte,
+            "lenkwechsel":      self._lenkwechsel,
+            "rueckwaerts":      self._rueckwaerts,
+            "hr_mittel":        hr_mit,
+            "hr_max":           hr_max,
+            "gueltig":          1 if gueltig else 0,
+            "notiz":            notiz,
+        }
+        recorder.log_aufgabe(zeile)
+        recorder.log_event(
+            "aufgabe_ende",
+            f"Durchgang {self._versuch}; {dauer:.2f} s; "
+            f"{'gueltig' if gueltig else 'VERWORFEN'}; "
+            f"Halte {self._halte}; Lenkeingaben {self._lenkwechsel}; "
+            f"Rueckwaerts {self._rueckwaerts}")
+
+        self._ergebnisse.append((self._versuch, dauer, gueltig,
+                                 self._halte, self._lenkwechsel, self._rueckwaerts))
+        self.zeit_var.set(f"{dauer:.1f} s")
+        self.start_button.config(text="▶  Aufgabe starten")
+        self.zwischen_button.config(state="disabled")
+        self.verwerfen_button.config(state="disabled")
+
+        gespeichert = "gespeichert" if recorder.active else "NICHT gespeichert (keine Aufzeichnung)"
+        self.status_var.set(
+            f"Durchgang {self._versuch} {'beendet' if gueltig else 'verworfen'}: "
+            f"{dauer:.1f} s – {gespeichert}. Bereit für Durchgang {self._versuch + 1}.")
+        self._anzeige_auffrischen()
+
+    # ── Anzeige ───────────────────────────────────────────────────────────────
+
+    def _anzeige_auffrischen(self):
+        self.person_var.set(self._teilnehmer_text())
+        if not self._ergebnisse:
+            self.tabelle_var.set("noch keine")
+            return
+        zeilen = ["  Nr |   Zeit  | Halte | Lenkeing. | Rueckw. | gueltig",
+                  "  ---+---------+-------+-----------+---------+--------"]
+        gueltige = []
+        for nr, dauer, gueltig, halte, lenk, rueck in self._ergebnisse:
+            zeilen.append(f"  {nr:2d} | {dauer:6.1f}s | {halte:5d} | {lenk:9d} | "
+                          f"{rueck:7d} | {'ja' if gueltig else 'NEIN'}")
+            if gueltig:
+                gueltige.append(dauer)
+        if len(gueltige) >= 2:
+            mittel = sum(gueltige) / len(gueltige)
+            zeilen.append("")
+            zeilen.append(f"  Mittel gueltiger Durchgaenge: {mittel:.1f} s "
+                          f"(bestes {min(gueltige):.1f} s, n={len(gueltige)})")
+        self.tabelle_var.set("\n".join(zeilen))
+
+    def close(self):
+        if self._laeuft:
+            # Ein laufender Durchgang darf nicht stillschweigend verschwinden.
+            self._beenden(gueltig=False, notiz="verworfen (Fenster geschlossen)")
+        self._scroll.unbind_mousewheel()
+        self.win.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Nullrichtung ausrichten
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3843,6 +4287,7 @@ def show_controller_ui():
     camera_thread_ref = [None]
     tune_window_ref = [None]
     aim_window_ref  = [None]
+    task_window_ref = [None]
 
     # ── Probandenverwaltung ───────────────────────────────────────────────────
     try:
@@ -4073,6 +4518,9 @@ def show_controller_ui():
     # der Sphero bei "vorwärts" in eine beliebige Richtung. Deshalb gleich
     # neben "Sphero starten" und nicht in einem Untermenü.
     aim_button    = ttk.Button(buttons, text="🧭  Sphero ausrichten")
+    # Die Standardaufgabe ist die eigentliche Messung der Studie und steht
+    # deshalb gleichrangig neben der Aufzeichnung, nicht in einem Untermenü.
+    task_button   = ttk.Button(buttons, text="🏁  Standardaufgabe")
     record_button = ttk.Button(buttons, text="⏺  Aufzeichnung starten")
 
     start_button.grid( row=0, column=0, sticky="ew", padx=(0, 6), pady=3)
@@ -4081,7 +4529,8 @@ def show_controller_ui():
     graph_button.grid( row=2, column=0, sticky="ew", padx=(0, 6), pady=3)
     camera_button.grid(row=2, column=1, sticky="ew",              pady=3)
     tune_button.grid(  row=3, column=0, columnspan=2, sticky="ew", pady=3)
-    record_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+    record_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=3)
+    task_button.grid(  row=5, column=0, columnspan=2, sticky="ew", pady=(3, 0))
     buttons.columnconfigure(0, weight=1)
     buttons.columnconfigure(1, weight=1)
 
@@ -4313,6 +4762,24 @@ def show_controller_ui():
             tune_window_ref[0] = DrivingTuneWindow(
                 root, speichern=fahrwerte_speichern, person_text=person_beschreibung)
 
+    def aufgabe_clicked():
+        aw = task_window_ref[0]
+        if aw is not None and aw.win.winfo_exists():
+            aw.win.lift()
+            return
+        if not recorder.active:
+            # Kein harter Abbruch: Für eigenes Ausprobieren ist der Timer auch
+            # ohne Aufzeichnung nützlich. Aber es muss klar sein, dass dann
+            # nichts in den Daten landet.
+            if not messagebox.askyesno(
+                    "Keine Aufzeichnung aktiv",
+                    "Es läuft gerade keine Aufzeichnung. Die Zeit wird dann zwar "
+                    "angezeigt, aber NICHT gespeichert.\n\n"
+                    "Für eine Studiensitzung bitte zuerst die Aufzeichnung starten.\n\n"
+                    "Trotzdem fortfahren (zum Ausprobieren)?"):
+                return
+        task_window_ref[0] = AufgabeFenster(root, person_beschreibung)
+
     def ausrichten_clicked():
         aw = aim_window_ref[0]
         if aw is not None and aw.win.winfo_exists():
@@ -4401,6 +4868,7 @@ def show_controller_ui():
     camera_button.config(command=toggle_camera)
     tune_button.config(  command=toggle_tuning)
     aim_button.config(   command=ausrichten_clicked)
+    task_button.config(  command=aufgabe_clicked)
     record_button.config(command=toggle_recording)
     root.protocol("WM_DELETE_WINDOW", on_close)
 
