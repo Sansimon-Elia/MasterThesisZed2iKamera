@@ -1002,9 +1002,33 @@ _CSV_SCHEMAS = {
     # abstand_m: Abstand der beiden Bodenmarkierungen. Steht in JEDER Zeile,
     # damit Zeiten aus verschiedenen Aufbauten nie stillschweigend in einen
     # Topf geraten – eine Sekunde auf 1 m Strecke ist etwas anderes als auf 2 m.
-    "aufgaben":     ["versuch", "abstand_m", "t_rel_start_s", "t_rel_ende_s",
-                      "dauer_s", "zwischenzeiten_s", "halte", "lenkwechsel",
-                      "rueckwaerts", "hr_mittel", "hr_max", "gueltig", "notiz"],
+    # rw_strecke_m: Länge der geraden Rückwärtsstrecke (Markierung 1 → 3).
+    #
+    # backward_dauer_s / backward_speed: die zum Zeitpunkt des Durchgangs
+    # gültigen Rückwärtsparameter. Sie sind zur Laufzeit verstellbar
+    # (Fahrverhalten justieren) und bestimmen unmittelbar, wie weit ein
+    # Doppeltipp trägt – ohne sie wäre die Rückwärtszeit zwischen Personen
+    # nicht vergleichbar, und die Abweichung fiele erst bei der Auswertung auf.
+    #
+    # Zeiten je Abschnitt statt nur Gesamtzeit: Vorwärts- und Rückwärtsanteil
+    # sind die eigentlich interessante Gegenüberstellung. t_standard_s ist die
+    # Summe der Vorwärtsabschnitte und entspricht der bisherigen Gesamtzeit –
+    # damit bleiben früher erhobene Durchgänge vergleichbar.
+    #
+    # Verglichen wird über die Tempi, nicht über die rohen Zeiten: Hinweg und
+    # Rückwärtsstrecke sind unterschiedlich lang, ein Zeitverhältnis wäre also
+    # von der Streckenwahl abhängig. ratio_rw_vw = Tempo rückwärts / Tempo
+    # vorwärts ist dagegen streckenunabhängig (Werte < 1 = langsamer rückwärts).
+    "aufgaben":     ["versuch", "abstand_m", "rw_strecke_m",
+                      "backward_dauer_s", "backward_speed",
+                      "t_rel_start_s", "t_rel_ende_s", "dauer_s",
+                      "t_hinweg_s", "t_rundkurs_s", "t_standard_s",
+                      "t_rueckwaerts_s",
+                      "v_hinweg_ms", "v_rueckwaerts_ms", "ratio_rw_vw",
+                      "zwischenzeiten_s", "halte", "lenkwechsel",
+                      "rueckwaerts", "rueckwaerts_korrektur",
+                      "rueckwaerts_strecke",
+                      "hr_mittel", "hr_max", "gueltig", "notiz"],
 }
 
 
@@ -2823,7 +2847,7 @@ class LiveGraphWindow:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Standardaufgabe: Zwei-Markierungen-Parcours
+# Standardaufgabe: Parcours mit Rückwärtsstrecke
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Wortlaut, der jeder Testperson VORGELESEN wird. Bewusst als fester Text und
@@ -2836,13 +2860,17 @@ class LiveGraphWindow:
 # sauber lösen. Sonst misst man Risikobereitschaft statt Steuerfähigkeit – und
 # die unterscheidet sich zwischen Altersgruppen systematisch.
 AUFGABE_ANLEITUNG = (
-    "Vor Ihnen liegen zwei Markierungen auf dem Boden.\n"
+    "Vor Ihnen liegen drei Markierungen auf dem Boden.\n"
     "\n"
     "Ihre Aufgabe:\n"
-    "  1.  Fahren Sie den Ball von der ersten zur zweiten Markierung.\n"
-    "  2.  Umrunden Sie die zweite Markierung einmal vollständig.\n"
-    "  3.  Fahren Sie zurück zur ersten Markierung.\n"
+    "  1.  Fahren Sie den Ball von Markierung 1 zu Markierung 2.\n"
+    "  2.  Umrunden Sie Markierung 2 einmal vollständig.\n"
+    "  3.  Fahren Sie zurück zu Markierung 1.\n"
     "  4.  Umrunden Sie auch diese einmal vollständig.\n"
+    "  5.  Fahren Sie den Ball zum Schluss rückwärts geradeaus von\n"
+    "      Markierung 1 zu Markierung 3. Rückwärts fahren Sie mit einem\n"
+    "      Doppeltipp auf die Uhr. Lenken können Sie dabei nicht – richten\n"
+    "      Sie den Ball also vorher aus.\n"
     "\n"
     "Danach ist der Durchgang beendet.\n"
     "\n"
@@ -2851,7 +2879,55 @@ AUFGABE_ANLEITUNG = (
     "klappt, fahren Sie einfach weiter."
 )
 
-AUFGABE_NAME = "Zwei-Markierungen-Parcours"
+AUFGABE_NAME = "Parcours mit Rückwärtsstrecke"
+
+# Der Durchgang wird in Abschnitte zerlegt, deren Grenzen die betreuende Person
+# per Knopfdruck setzt. Grund: Die Gesamtzeit allein vermischt Vorwärts- und
+# Rückwärtsanteil, und genau deren Gegenüberstellung ist die Zielgröße.
+#
+# Warum die Rückwärtsstrecke gerade verläuft und nicht um eine Markierung
+# herumführt: Während der Rückwärtsfahrt ist die Lenkung gesperrt
+# (Rückwärtsfahrt hat Vorrang vor der Gravity-Steuerung). Eine Kurve rückwärts
+# wäre damit nicht lösbar, sondern nur frustrierend. Eine gerade Strecke
+# entspricht zudem dem etablierten Backward-Walk-Test, der ebenfalls geradlinig
+# und ohne Drehung gemessen wird.
+#
+# Aufbau: Markierung 3 liegt auf der Verlängerung der Linie 2–1 jenseits von
+# Markierung 1. So steht Markierung 2 der Rückwärtsstrecke nicht im Weg.
+#
+#   3 <···· rueckwaerts ····  1  ──── hinweg ────>  2
+#
+# (schluessel, ueberschrift, was die betreuende Person tut)
+AUFGABE_ABSCHNITTE = (
+    ("hinweg",
+     "① Hinweg vorwärts – Markierung 1 → 2",
+     "„Abschnitt beendet“ drücken, sobald der Ball Markierung 2 erreicht."),
+    ("rundkurs",
+     "②–④ Umrunden, zurückfahren, umrunden",
+     "„Abschnitt beendet“ drücken, sobald Markierung 1 vollständig umrundet ist."),
+    ("rueckwaerts",
+     "⑤ Rückwärtsstrecke – Markierung 1 → 3",
+     "„Durchgang beenden“ drücken, sobald der Ball Markierung 3 erreicht."),
+)
+
+# Feste Eingewöhnungsdauer vor dem ersten Durchgang.
+#
+# Bewusst eine Zeitvorgabe und kein "bis Sie sich sicher fühlen": Wie lange
+# jemand von sich aus übt, hängt mit Alter, Technikaffinität und Selbstvertrauen
+# zusammen – also genau mit den Merkmalen, deren Wirkung untersucht werden soll.
+# Selbstbestimmte Übungsdauer wäre damit keine Randbedingung, sondern eine
+# unkontrollierte Störvariable im Zentrum der Fragestellung.
+EINGEWOEHNUNG_S = 180
+
+# Vorgabe für die Länge der Rückwärtsstrecke in Metern.
+#
+# Deutlich länger als der Markierungsabstand, und das aus einem messtechnischen
+# Grund: Ein Doppeltipp fährt BACKWARD_DURATION Sekunden mit BACKWARD_SPEED –
+# bei den Vorgabewerten rund einen Meter. Auf einer Ein-Meter-Strecke wäre der
+# Abschnitt mit einem einzigen Tipp erledigt und die gemessene Zeit bestünde
+# fast nur aus Reaktions- und Ausrichtzeit. Drei Meter verlangen mehrere Tipps
+# mit Nachkorrektur und entsprechen der Streckenlänge des Backward-Walk-Tests.
+RUECKWAERTS_STRECKE_M = 3.0
 
 
 class AufgabeFenster:
@@ -2870,6 +2946,19 @@ class AufgabeFenster:
     folgenden auszuwerten – deshalb wird jeder Durchgang nummeriert, statt nur
     eine Bestzeit zu behalten.
 
+    Der Durchgang enthält am Ende eine gerade RÜCKWÄRTSSTRECKE. Grund: Eine
+    Aufgabe, die alle Altersgruppen mühelos lösen, zeigt keine Unterschiede –
+    Altersunterschiede in der Bewegungssteuerung treten erst mit steigender
+    Aufgabenkomplexität hervor. Rückwärtsbewegung ist dafür der belegt
+    empfindlichste Zusatz: Sie verlangt eine Umkehrung der Steuerzuordnung, und
+    hier zusätzlich Vorausplanung, weil während der Rückwärtsfahrt nicht
+    gelenkt werden kann.
+
+    Die Abschnitte werden getrennt gestoppt (AUFGABE_ABSCHNITTE), damit sich
+    Vorwärts- und Rückwärtsanteil gegenüberstellen lassen. Die Summe der
+    Vorwärtsabschnitte entspricht der früheren Gesamtzeit des Parcours, sodass
+    bereits erhobene Durchgänge vergleichbar bleiben.
+
     Misslungene Durchgänge werden als ungültig MARKIERT, nicht gelöscht. Wer
     Fehlversuche verschwinden lässt, verzerrt die Stichprobe.
     """
@@ -2878,8 +2967,8 @@ class AufgabeFenster:
 
     def __init__(self, parent, teilnehmer_text):
         self.win = tk.Toplevel(parent)
-        self.win.title("Standardaufgabe")
-        self.win.geometry("640x780")
+        self.win.title(f"Standardaufgabe – {AUFGABE_NAME}")
+        self.win.geometry("640x820")
         self.win.minsize(560, 560)
         self.win.transient(parent)
 
@@ -2888,6 +2977,18 @@ class AufgabeFenster:
         self._job         = None
         self._versuch     = 0
         self._ergebnisse  = []
+
+        # Abschnittssteuerung innerhalb eines laufenden Durchgangs.
+        self._abschnitt_i     = 0
+        self._abschnitt_t0    = 0.0
+        self._abschnitt_zeit  = {}   # schluessel -> Dauer in Sekunden
+        self._abschnitt_rueck = {}   # schluessel -> Doppeltipps in diesem Abschnitt
+
+        # Eingewöhnung
+        self._eing_laeuft     = False
+        self._eing_job        = None
+        self._eing_ende_t     = 0.0
+        self._eing_absolviert = False
 
         scroll = probanden._ScrollFrame(self.win, height=620)
         scroll.pack(fill="both", expand=True, padx=14, pady=(12, 0))
@@ -2909,17 +3010,32 @@ class AufgabeFenster:
         # nach Monaten keine belastbare Auskunft mehr.
         aufbau = ttk.Frame(main)
         aufbau.pack(fill="x", pady=(8, 0))
-        ttk.Label(aufbau, text="Abstand der Markierungen (m):",
+        ttk.Label(aufbau, text="Abstand Markierung 1–2 (m):",
                   font=("Segoe UI", 10, "bold")).pack(side="left")
         self.var_abstand = tk.StringVar(value="1.0")
         ttk.Entry(aufbau, textvariable=self.var_abstand,
+                  width=6, justify="center").pack(side="left", padx=(8, 16))
+        ttk.Label(aufbau, text="Rückwärtsstrecke 1–3 (m):",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.var_rw_strecke = tk.StringVar(value=f"{RUECKWAERTS_STRECKE_M:.1f}")
+        ttk.Entry(aufbau, textvariable=self.var_rw_strecke,
                   width=6, justify="center").pack(side="left", padx=(8, 0))
         ttk.Label(main,
-                  text="Muss über die GESAMTE Studie gleich bleiben – sonst sind die "
-                       "Zeiten zwischen den Testpersonen nicht vergleichbar. Wird mit "
-                       "jedem Durchgang gespeichert.",
+                  text="Beide Maße müssen über die GESAMTE Studie gleich bleiben – sonst "
+                       "sind die Zeiten zwischen den Testpersonen nicht vergleichbar. Sie "
+                       "werden mit jedem Durchgang gespeichert.",
                   foreground="#777", wraplength=560,
                   justify="left").pack(anchor="w", pady=(2, 0))
+        ttk.Label(main,
+                  text="Markierung 3 liegt auf der Verlängerung der Linie 2–1, hinter "
+                       "Markierung 1 – damit Markierung 2 der Rückwärtsstrecke nicht im "
+                       "Weg steht. Kürzer als 2 m sollte sie nicht sein: Ein Doppeltipp "
+                       "trägt bei den Vorgabewerten schon rund einen Meter weit.",
+                  foreground="#777", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+        self.rueck_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.rueck_var, foreground="#777",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(2, 0))
 
         # ── Anleitung zum Vorlesen ────────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(12, 8))
@@ -2936,6 +3052,36 @@ class AufgabeFenster:
         anleitung.insert("1.0", AUFGABE_ANLEITUNG)
         anleitung.config(state="disabled")
         anleitung.pack(fill="x")
+
+        # ── Eingewöhnung ──────────────────────────────────────────────────────
+        # Steht vor der Zeitnahme, weil sie im Ablauf davor liegt und weil sie
+        # sonst übersprungen wird.
+        ttk.Separator(main).pack(fill="x", pady=(12, 8))
+        ttk.Label(main, text=f"Eingewöhnung ({EINGEWOEHNUNG_S // 60}:"
+                             f"{EINGEWOEHNUNG_S % 60:02d} min, vor dem ersten Durchgang)",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(main,
+                  text="Freies Fahren zum Kennenlernen der Steuerung, ohne Aufgabe. Die "
+                       "Dauer ist fest vorgegeben und für alle Testpersonen gleich: Wie "
+                       "lange jemand von sich aus übt, hängt mit Alter und Selbstvertrauen "
+                       "zusammen – bei freier Übungsdauer wüsste man am Ende nicht, ob "
+                       "Unterschiede aus der Steuerfähigkeit oder aus ungleicher Übung "
+                       "stammen.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(2, 4))
+
+        eing = ttk.Frame(main)
+        eing.pack(fill="x", pady=(2, 0))
+        self.eing_button = ttk.Button(eing, text="🕒  Eingewöhnung starten",
+                                      command=self._eing_umschalten)
+        self.eing_button.pack(side="left")
+        self.eing_var = tk.StringVar(value=self._mmss(EINGEWOEHNUNG_S))
+        ttk.Label(eing, textvariable=self.eing_var,
+                  font=("Consolas", 20, "bold"),
+                  foreground="#0a7").pack(side="left", padx=(12, 0))
+        self.eing_status_var = tk.StringVar(value="noch nicht durchgeführt")
+        ttk.Label(main, textvariable=self.eing_status_var, foreground="#777",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(2, 0))
 
         # ── Zeitnahme ─────────────────────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(12, 8))
@@ -2955,9 +3101,20 @@ class AufgabeFenster:
                   font=("Consolas", 34, "bold"),
                   foreground="#06c").pack(anchor="w", pady=(4, 2))
 
+        # Welcher Abschnitt gerade läuft und was ihn beendet. Ohne diese Anzeige
+        # müsste die betreuende Person die Abschnittsfolge auswendig kennen –
+        # ein verpasster Knopfdruck macht die Aufteilung des Durchgangs kaputt.
+        self.abschnitt_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.abschnitt_var,
+                  font=("Segoe UI", 11, "bold"), foreground="#c60",
+                  wraplength=560, justify="left").pack(anchor="w")
+        self.abschnitt_hinweis_var = tk.StringVar(value="")
+        ttk.Label(main, textvariable=self.abschnitt_hinweis_var, foreground="#555",
+                  wraplength=560, justify="left").pack(anchor="w")
+
         self.status_var = tk.StringVar(value="Bereit für Durchgang 1.")
         ttk.Label(main, textvariable=self.status_var, wraplength=560,
-                  justify="left").pack(anchor="w")
+                  justify="left").pack(anchor="w", pady=(4, 0))
 
         self.zwischen_var = tk.StringVar(value="")
         ttk.Label(main, textvariable=self.zwischen_var, font=("Consolas", 9),
@@ -2969,8 +3126,8 @@ class AufgabeFenster:
         self.start_button = ttk.Button(knoepfe, text="▶  Aufgabe starten",
                                        command=self._umschalten)
         self.start_button.pack(side="left")
-        self.zwischen_button = ttk.Button(knoepfe, text="⏱  Zwischenzeit",
-                                          command=self._zwischenzeit,
+        self.zwischen_button = ttk.Button(knoepfe, text="⏭  Abschnitt beendet",
+                                          command=self._abschnitt_weiter,
                                           state="disabled")
         self.zwischen_button.pack(side="left", padx=(8, 0))
         self.verwerfen_button = ttk.Button(knoepfe, text="✖  Durchgang verwerfen",
@@ -2979,8 +3136,9 @@ class AufgabeFenster:
         self.verwerfen_button.pack(side="left", padx=(8, 0))
 
         ttk.Label(main,
-                  text="Zwischenzeit ist freiwillig – etwa nach jeder der vier "
-                       "Teilstrecken. Sie unterbricht die Messung nicht.",
+                  text="„Abschnitt beendet“ unterbricht die Messung nicht – die Gesamtzeit "
+                       "läuft weiter. Der Knopf trennt nur den Vorwärts- vom "
+                       "Rückwärtsanteil, und genau deren Verhältnis ist die Zielgröße.",
                   foreground="#777", wraplength=560,
                   justify="left").pack(anchor="w", pady=(6, 0))
 
@@ -3010,58 +3168,167 @@ class AufgabeFenster:
         Ein Foto einer fremden Umgebung würde dagegen Details zeigen, die mit
         dem eigenen Aufbau nichts zu tun haben.
         """
-        c = tk.Canvas(parent, width=560, height=210, background="white",
+        c = tk.Canvas(parent, width=560, height=240, background="white",
                       highlightthickness=1, highlightbackground="#ccc")
         c.pack(anchor="w", pady=(4, 0))
 
-        a = (150, 105)
-        b = (410, 105)
-        r_mark = 20
-        r_bahn = 48
+        drei = (72, 125)
+        a    = (250, 125)     # Markierung 1 – Start und Wendepunkt
+        b    = (452, 125)     # Markierung 2
+        r_mark = 18
+        r_bahn = 38
 
         # Markierungen
-        for (x, y), name in ((a, "1"), (b, "2")):
+        for (x, y), name in ((drei, "3"), (a, "1"), (b, "2")):
             c.create_oval(x - r_mark, y - r_mark, x + r_mark, y + r_mark,
                           fill="#ffd9a0", outline="#c07000", width=2)
             c.create_text(x, y, text=name, font=("Segoe UI", 13, "bold"),
                           fill="#7a4400")
+        c.create_text(drei[0], drei[1] + r_mark + 14, text="nur rueckwaerts",
+                      font=("Segoe UI", 8), fill="#7a4400")
 
         # Hinweg oben, Rückweg unten – räumlich getrennt, damit die Richtung
         # der Umrundung erkennbar bleibt.
-        c.create_line(a[0] + 30, a[1] - 42, b[0] - 30, b[1] - 42,
+        c.create_line(a[0] + 30, a[1] - 44, b[0] - 30, b[1] - 44,
                       arrow="last", width=3, fill="#0a7", smooth=True)
-        c.create_text((a[0] + b[0]) / 2, a[1] - 56, text="① hinfahren",
+        c.create_text((a[0] + b[0]) / 2, a[1] - 58, text="① hinfahren",
                       font=("Segoe UI", 9, "bold"), fill="#0a7")
 
         c.create_arc(b[0] - r_bahn, b[1] - r_bahn, b[0] + r_bahn, b[1] + r_bahn,
                      start=100, extent=-290, style="arc", width=3, outline="#c60")
-        c.create_text(b[0] + r_bahn + 34, b[1], text="② umrunden",
+        c.create_text(b[0], b[1] + r_bahn + 18, text="② umrunden",
                       font=("Segoe UI", 9, "bold"), fill="#c60")
 
-        c.create_line(b[0] - 30, b[1] + 42, a[0] + 30, a[1] + 42,
+        c.create_line(b[0] - 30, b[1] + 44, a[0] + 30, a[1] + 44,
                       arrow="last", width=3, fill="#06c", smooth=True)
-        c.create_text((a[0] + b[0]) / 2, a[1] + 56, text="③ zurueckfahren",
+        c.create_text((a[0] + b[0]) / 2, a[1] + 58, text="③ zurueckfahren",
                       font=("Segoe UI", 9, "bold"), fill="#06c")
 
         c.create_arc(a[0] - r_bahn, a[1] - r_bahn, a[0] + r_bahn, a[1] + r_bahn,
                      start=80, extent=290, style="arc", width=3, outline="#c60")
-        c.create_text(a[0] - r_bahn - 34, a[1], text="④ umrunden",
+        c.create_text(a[0], a[1] + r_bahn + 18, text="④ umrunden",
                       font=("Segoe UI", 9, "bold"), fill="#c60")
+
+        # Rückwärtsstrecke: auf der Achse selbst, gestrichelt und in einer
+        # eigenen Farbe – sie unterscheidet sich nicht nur im Verlauf, sondern
+        # in der Art der Fortbewegung von allem anderen.
+        c.create_line(a[0] - r_bahn - 8, a[1], drei[0] + r_mark + 8, drei[1],
+                      arrow="last", width=3, fill="#a0a", dash=(6, 4))
+        c.create_text((drei[0] + a[0]) / 2, a[1] - 16,
+                      text="⑤ rueckwaerts (Doppeltipp)",
+                      font=("Segoe UI", 9, "bold"), fill="#a0a")
+        c.create_text((drei[0] + a[0]) / 2, a[1] + 16,
+                      text="gerade, ohne Lenken",
+                      font=("Segoe UI", 8), fill="#a0a")
 
     # ── Ablauf ────────────────────────────────────────────────────────────────
 
     def _abstand_m(self) -> str:
+        """Eingetragener Abstand der Markierungen 1 und 2 als Zahltext."""
+        return self._meter(self.var_abstand)
+
+    def _rw_strecke_m(self) -> str:
+        """Eingetragene Länge der Rückwärtsstrecke als Zahltext."""
+        return self._meter(self.var_rw_strecke)
+
+    @staticmethod
+    def _meter(var) -> str:
         """
-        Eingetragener Markierungsabstand als Zahltext, "" wenn unlesbar.
+        Meterangabe aus einem Eingabefeld, "" wenn unlesbar.
 
         Deutsche Tastaturen liefern gern ein Komma – das wird akzeptiert.
         Unlesbares wird nicht verworfen, sondern als leeres Feld gespeichert
         und fällt so in der Auswertung sofort auf.
         """
         try:
-            return f"{float(self.var_abstand.get().strip().replace(',', '.')):.2f}"
+            return f"{float(var.get().strip().replace(',', '.')):.2f}"
+        except (TypeError, ValueError, AttributeError):
+            return ""
+
+    @staticmethod
+    def _mmss(sekunden: float) -> str:
+        s = max(0, int(round(sekunden)))
+        return f"{s // 60}:{s % 60:02d}"
+
+    @staticmethod
+    def _tempo(strecke_m: str, dauer_s) -> str:
+        """
+        Tempo in m/s aus Streckentext und Dauer, "" wenn eines davon fehlt.
+
+        Die Tempi sind der Grund, warum unterschiedlich lange Abschnitte
+        überhaupt gegenübergestellt werden können: Ein Zeitverhältnis hinge an
+        der gewählten Streckenlänge, ein Tempoverhältnis nicht.
+        """
+        try:
+            strecke = float(strecke_m)
+            dauer   = float(dauer_s)
         except (TypeError, ValueError):
             return ""
+        if strecke <= 0 or dauer <= 0:
+            return ""
+        return f"{strecke / dauer:.3f}"
+
+    # ── Eingewöhnung ──────────────────────────────────────────────────────────
+
+    def _eing_umschalten(self):
+        if self._eing_laeuft:
+            # Vorzeitiger Abbruch wird als solcher festgehalten: Eine verkürzte
+            # Eingewöhnung ist eine andere Vorbereitung und muss bei der
+            # Auswertung erkennbar sein.
+            self._eing_beenden(abgebrochen=True)
+        else:
+            self._eing_starten()
+
+    def _eing_starten(self):
+        start_server_once()
+        self._eing_laeuft = True
+        self._eing_ende_t = clock.t_abs() + EINGEWOEHNUNG_S
+        self.eing_button.config(text="■  Eingewöhnung abbrechen")
+        hinweis = ("" if recorder.active else
+                   "  (keine Aufzeichnung aktiv – wird nicht protokolliert)")
+        self.eing_status_var.set("läuft – freies Fahren ohne Aufgabe." + hinweis)
+        recorder.log_event("eingewoehnung_start",
+                           f"{AUFGABE_NAME}; Vorgabe {EINGEWOEHNUNG_S} s")
+        self._eing_tick()
+
+    def _eing_tick(self):
+        if not self._eing_laeuft:
+            return
+        rest = self._eing_ende_t - clock.t_abs()
+        if rest <= 0:
+            self.eing_var.set("0:00")
+            self._eing_beenden(abgebrochen=False)
+            return
+        self.eing_var.set(self._mmss(rest))
+        self._eing_job = self.win.after(200, self._eing_tick)
+
+    def _eing_beenden(self, abgebrochen: bool):
+        self._eing_laeuft = False
+        if self._eing_job is not None:
+            try:
+                self.win.after_cancel(self._eing_job)
+            except Exception:
+                pass
+            self._eing_job = None
+
+        gefahren = EINGEWOEHNUNG_S - max(0.0, self._eing_ende_t - clock.t_abs())
+        self._eing_absolviert = not abgebrochen
+        self.eing_button.config(text="🕒  Eingewöhnung starten")
+        self.eing_var.set(self._mmss(EINGEWOEHNUNG_S))
+        if abgebrochen:
+            self.eing_status_var.set(
+                f"ABGEBROCHEN nach {gefahren:.0f} s von {EINGEWOEHNUNG_S} s – "
+                f"bitte in den Notizen vermerken.")
+        else:
+            self.eing_status_var.set(
+                f"abgeschlossen ({EINGEWOEHNUNG_S} s). "
+                f"Bereit für Durchgang {self._versuch + 1}.")
+        recorder.log_event(
+            "eingewoehnung_ende",
+            f"{gefahren:.1f} s von {EINGEWOEHNUNG_S} s; "
+            f"{'ABGEBROCHEN' if abgebrochen else 'vollstaendig'}")
+
+    # ── Durchgang ─────────────────────────────────────────────────────────────
 
     def _umschalten(self):
         if self._laeuft:
@@ -3076,6 +3343,13 @@ class AufgabeFenster:
         self._t_start  = clock.t_abs()
         self._zwischen = []
 
+        # Abschnitt 1 beginnt mit dem Durchgang.
+        self._abschnitt_i     = 0
+        self._abschnitt_t0    = self._t_start
+        self._abschnitt_zeit  = {}
+        self._abschnitt_rueck = {}
+        self._rueck_bei_abschnitt = 0
+
         # Nebenkennzahlen: Zustand beim Start als Bezug, dann Wechsel zählen.
         with data_lock:
             self._letzter_zustand = latest_data["state"]
@@ -3085,24 +3359,102 @@ class AufgabeFenster:
         self._rueckwaerts = 0
         self._hr = []
 
-        self.start_button.config(text="■  Aufgabe beenden")
+        # Die Rückwärtsparameter werden beim Start eingefroren, nicht am Ende
+        # ausgelesen: Sie sind über das Fahrverhalten-Fenster zur Laufzeit
+        # verstellbar, und gespeichert gehört der Wert, unter dem tatsächlich
+        # gefahren wurde.
+        self._backward_dauer = BACKWARD_DURATION
+        self._backward_speed = BACKWARD_SPEED
+
+        self.start_button.config(text="■  Durchgang beenden")
         self.zwischen_button.config(state="normal")
         self.verwerfen_button.config(state="normal")
         self.zwischen_var.set("")
         hinweis = ("" if recorder.active else
                    "   ACHTUNG: keine Aufzeichnung aktiv – dieser Durchgang "
                    "wird NICHT gespeichert.")
+        if not self._eing_absolviert:
+            hinweis += ("   HINWEIS: Eingewöhnung wurde nicht vollständig "
+                        "durchgeführt.")
         self.status_var.set(f"Durchgang {self._versuch} läuft.{hinweis}")
+        self._abschnitt_anzeigen()
         recorder.log_event("aufgabe_start",
                            f"{AUFGABE_NAME}; Durchgang {self._versuch}; "
-                           f"Abstand {self._abstand_m() or '?'} m")
+                           f"Abstand {self._abstand_m() or '?'} m; "
+                           f"Rueckwaertsstrecke {self._rw_strecke_m() or '?'} m; "
+                           f"backward {self._backward_dauer} s / "
+                           f"{self._backward_speed}")
         self._tick()
+
+    # ── Abschnitte ────────────────────────────────────────────────────────────
+
+    def _abschnitt_anzeigen(self):
+        """Laufenden Abschnitt und die zugehörige Handlung im Fenster zeigen."""
+        if not self._laeuft:
+            self.abschnitt_var.set("")
+            self.abschnitt_hinweis_var.set("")
+            self.zwischen_button.config(text="⏭  Abschnitt beendet")
+            return
+        _, ueberschrift, handlung = AUFGABE_ABSCHNITTE[self._abschnitt_i]
+        self.abschnitt_var.set(
+            f"Abschnitt {self._abschnitt_i + 1} von {len(AUFGABE_ABSCHNITTE)}: "
+            f"{ueberschrift}")
+        self.abschnitt_hinweis_var.set(handlung)
+        letzter = self._abschnitt_i >= len(AUFGABE_ABSCHNITTE) - 1
+        # Im letzten Abschnitt gibt es nichts mehr weiterzuschalten – der
+        # Durchgang endet dort. Ein aktiver Knopf würde nur zu einem
+        # versehentlich übersprungenen Abschnitt einladen.
+        self.zwischen_button.config(
+            state="disabled" if letzter else "normal",
+            text="⏭  Abschnitt beendet")
+
+    def _abschnitt_weiter(self):
+        """Laufenden Abschnitt abschließen und den nächsten beginnen."""
+        if not self._laeuft:
+            return
+        if self._abschnitt_i >= len(AUFGABE_ABSCHNITTE) - 1:
+            return
+        self._abschnitt_abschliessen()
+        self._abschnitt_i += 1
+        self._abschnitt_anzeigen()
+
+    def _abschnitt_abschliessen(self):
+        """
+        Zeit und Doppeltipps des laufenden Abschnitts festhalten.
+
+        Die Doppeltipps werden je Abschnitt getrennt gezählt, weil sie dort
+        Verschiedenes bedeuten: In den Vorwärtsabschnitten sind sie
+        Fehlerkorrekturen, im Rückwärtsabschnitt das Fortbewegungsmittel. In
+        einer gemeinsamen Summe wären beide nicht mehr auseinanderzuhalten.
+        """
+        schluessel = AUFGABE_ABSCHNITTE[self._abschnitt_i][0]
+        jetzt = clock.t_abs()
+        self._abschnitt_zeit[schluessel]  = jetzt - self._abschnitt_t0
+        self._abschnitt_rueck[schluessel] = (self._rueckwaerts
+                                             - self._rueck_bei_abschnitt)
+        self._rueck_bei_abschnitt = self._rueckwaerts
+        self._abschnitt_t0 = jetzt
+
+        seit_start = jetzt - self._t_start
+        self._zwischen.append(round(seit_start, 1))
+        self.zwischen_var.set(
+            "Abschnitte: " + "  ".join(
+                f"{AUFGABE_ABSCHNITTE[i][0]} {self._abschnitt_zeit[k]:.1f}s"
+                for i, (k, _, _) in enumerate(AUFGABE_ABSCHNITTE)
+                if k in self._abschnitt_zeit))
+        recorder.log_event(
+            "aufgabe_abschnitt",
+            f"Durchgang {self._versuch}; {schluessel}; "
+            f"{self._abschnitt_zeit[schluessel]:.2f} s; "
+            f"bei {seit_start:.2f} s; "
+            f"Doppeltipps {self._abschnitt_rueck[schluessel]}")
 
     def _tick(self):
         if not self._laeuft:
             return
         verstrichen = clock.t_abs() - self._t_start
-        self.zeit_var.set(f"{verstrichen:.1f} s")
+        im_abschnitt = clock.t_abs() - self._abschnitt_t0
+        self.zeit_var.set(f"{verstrichen:.1f} s   ({im_abschnitt:.1f} s)")
 
         with data_lock:
             zustand  = latest_data["state"]
@@ -3127,23 +3479,22 @@ class AufgabeFenster:
 
         self._job = self.win.after(self.TAKT_MS, self._tick)
 
-    def _zwischenzeit(self):
-        if not self._laeuft:
-            return
-        t = clock.t_abs() - self._t_start
-        self._zwischen.append(round(t, 1))
-        self.zwischen_var.set("Zwischenzeiten: "
-                              + "  ".join(f"{z:.1f}s" for z in self._zwischen))
-        recorder.log_event("aufgabe_zwischenzeit",
-                           f"Durchgang {self._versuch}; {t:.1f} s")
-
     def _verwerfen(self):
         if not self._laeuft:
             return
-        notiz = "verworfen (waehrend des Durchgangs abgebrochen)"
+        offen = AUFGABE_ABSCHNITTE[self._abschnitt_i][0]
+        notiz = (f"verworfen (waehrend des Durchgangs abgebrochen, "
+                 f"Abschnitt {offen})")
         self._beenden(gueltig=False, notiz=notiz)
 
     def _beenden(self, gueltig: bool, notiz: str = ""):
+        self._laeuft_bis_ende = (self._abschnitt_i
+                                 >= len(AUFGABE_ABSCHNITTE) - 1)
+        # Den laufenden Abschnitt noch abschließen, sonst fehlte seine Zeit.
+        # Das gilt auch für verworfene Durchgänge: Wo der Abbruch passiert ist,
+        # gehört zur Begründung dazu.
+        if self._laeuft:
+            self._abschnitt_abschliessen()
         self._laeuft = False
         if self._job is not None:
             try:
@@ -3157,35 +3508,84 @@ class AufgabeFenster:
         hr_mit  = round(sum(self._hr) / len(self._hr), 1) if self._hr else ""
         hr_max  = round(max(self._hr), 1) if self._hr else ""
 
+        # Wird der Durchgang beendet, bevor alle Abschnitte durchlaufen sind,
+        # bleiben deren Felder leer statt auf 0 zu stehen: Eine 0 wäre in der
+        # Auswertung eine Zahl wie jede andere, ein leeres Feld ist erkennbar
+        # ein fehlender Wert.
+        if not self._laeuft_bis_ende and not notiz:
+            offen = AUFGABE_ABSCHNITTE[self._abschnitt_i][0]
+            notiz = f"vorzeitig beendet (letzter Abschnitt: {offen})"
+
+        def zeit(schluessel):
+            wert = self._abschnitt_zeit.get(schluessel)
+            return f"{wert:.2f}" if wert is not None else ""
+
+        def tipps(schluessel):
+            wert = self._abschnitt_rueck.get(schluessel)
+            return wert if wert is not None else ""
+
+        t_hin   = self._abschnitt_zeit.get("hinweg")
+        t_rund  = self._abschnitt_zeit.get("rundkurs")
+        t_rueck = self._abschnitt_zeit.get("rueckwaerts")
+        # Summe der Vorwärtsabschnitte = die frühere Gesamtzeit des Parcours.
+        t_standard = (f"{t_hin + t_rund:.2f}"
+                      if t_hin is not None and t_rund is not None else "")
+
+        abstand    = self._abstand_m()
+        rw_strecke = self._rw_strecke_m()
+        v_hin   = self._tempo(abstand, t_hin)
+        v_rueck = self._tempo(rw_strecke, t_rueck)
+        ratio   = (f"{float(v_rueck) / float(v_hin):.3f}"
+                   if v_hin and v_rueck and float(v_hin) > 0 else "")
+
+        korrektur = sum(self._abschnitt_rueck.get(k, 0)
+                        for k in ("hinweg", "rundkurs"))
+
         zeile = {
-            "versuch":          self._versuch,
-            "abstand_m":        self._abstand_m(),
-            "t_rel_start_s":    f"{recorder.t_rel(self._t_start):.3f}" if recorder.active else "",
-            "t_rel_ende_s":     f"{recorder.t_rel(t_ende):.3f}" if recorder.active else "",
-            "dauer_s":          f"{dauer:.2f}",
-            "zwischenzeiten_s": " ".join(f"{z:.1f}" for z in self._zwischen),
-            "halte":            self._halte,
-            "lenkwechsel":      self._lenkwechsel,
-            "rueckwaerts":      self._rueckwaerts,
-            "hr_mittel":        hr_mit,
-            "hr_max":           hr_max,
-            "gueltig":          1 if gueltig else 0,
-            "notiz":            notiz,
+            "versuch":               self._versuch,
+            "abstand_m":             abstand,
+            "rw_strecke_m":          rw_strecke,
+            "backward_dauer_s":      f"{self._backward_dauer:.1f}",
+            "backward_speed":        self._backward_speed,
+            "t_rel_start_s":         f"{recorder.t_rel(self._t_start):.3f}" if recorder.active else "",
+            "t_rel_ende_s":          f"{recorder.t_rel(t_ende):.3f}" if recorder.active else "",
+            "dauer_s":               f"{dauer:.2f}",
+            "t_hinweg_s":            zeit("hinweg"),
+            "t_rundkurs_s":          zeit("rundkurs"),
+            "t_standard_s":          t_standard,
+            "t_rueckwaerts_s":       zeit("rueckwaerts"),
+            "v_hinweg_ms":           v_hin,
+            "v_rueckwaerts_ms":      v_rueck,
+            "ratio_rw_vw":           ratio,
+            "zwischenzeiten_s":      " ".join(f"{z:.1f}" for z in self._zwischen),
+            "halte":                 self._halte,
+            "lenkwechsel":           self._lenkwechsel,
+            "rueckwaerts":           self._rueckwaerts,
+            "rueckwaerts_korrektur": korrektur,
+            "rueckwaerts_strecke":   tipps("rueckwaerts"),
+            "hr_mittel":             hr_mit,
+            "hr_max":                hr_max,
+            "gueltig":               1 if gueltig else 0,
+            "notiz":                 notiz,
         }
         recorder.log_aufgabe(zeile)
         recorder.log_event(
             "aufgabe_ende",
-            f"Durchgang {self._versuch}; {dauer:.2f} s; "
+            f"Durchgang {self._versuch}; {dauer:.2f} s "
+            f"(vorwaerts {t_standard or '?'} s, rueckwaerts "
+            f"{zeit('rueckwaerts') or '?'} s, Ratio {ratio or '?'}); "
             f"{'gueltig' if gueltig else 'VERWORFEN'}; "
             f"Halte {self._halte}; Lenkeingaben {self._lenkwechsel}; "
-            f"Rueckwaerts {self._rueckwaerts}")
+            f"Rueckwaerts {self._rueckwaerts} "
+            f"(Korrektur {korrektur}, Strecke {tipps('rueckwaerts') or 0})")
 
-        self._ergebnisse.append((self._versuch, dauer, gueltig,
-                                 self._halte, self._lenkwechsel, self._rueckwaerts))
+        self._ergebnisse.append((self._versuch, dauer, t_standard,
+                                 zeit("rueckwaerts"), ratio, gueltig))
         self.zeit_var.set(f"{dauer:.1f} s")
         self.start_button.config(text="▶  Aufgabe starten")
         self.zwischen_button.config(state="disabled")
         self.verwerfen_button.config(state="disabled")
+        self._abschnitt_anzeigen()
 
         gespeichert = "gespeichert" if recorder.active else "NICHT gespeichert (keine Aufzeichnung)"
         self.status_var.set(
@@ -3197,28 +3597,47 @@ class AufgabeFenster:
 
     def _anzeige_auffrischen(self):
         self.person_var.set(self._teilnehmer_text())
+        # Die Rückwärtsparameter stehen sichtbar im Fenster, weil sie über das
+        # Fahrverhalten-Fenster verstellbar sind und unmittelbar bestimmen, wie
+        # weit ein Doppeltipp trägt. Ändern sie sich mitten in der Erhebung,
+        # sind die Rückwärtszeiten nicht mehr vergleichbar.
+        self.rueck_var.set(
+            f"Rückwärtsfahrt zurzeit: {BACKWARD_DURATION:.1f} s je Doppeltipp "
+            f"bei Tempo {BACKWARD_SPEED}. Über die gesamte Studie unverändert "
+            f"lassen – wird mit jedem Durchgang gespeichert.")
+
         if not self._ergebnisse:
             self.tabelle_var.set("noch keine")
             return
-        zeilen = ["  Nr |   Zeit  | Halte | Lenkeing. | Rueckw. | gueltig",
-                  "  ---+---------+-------+-----------+---------+--------"]
-        gueltige = []
-        for nr, dauer, gueltig, halte, lenk, rueck in self._ergebnisse:
-            zeilen.append(f"  {nr:2d} | {dauer:6.1f}s | {halte:5d} | {lenk:9d} | "
-                          f"{rueck:7d} | {'ja' if gueltig else 'NEIN'}")
-            if gueltig:
-                gueltige.append(dauer)
-        if len(gueltige) >= 2:
-            mittel = sum(gueltige) / len(gueltige)
+        zeilen = ["  Nr | gesamt  | vorwaerts | rueckw. | Ratio | gueltig",
+                  "  ---+---------+-----------+---------+-------+--------"]
+        gewertet = []
+        for nr, dauer, t_std, t_rw, ratio, gueltig in self._ergebnisse:
+            zeilen.append(
+                f"  {nr:2d} | {dauer:6.1f}s | {(t_std or '-'):>8s}s | "
+                f"{(t_rw or '-'):>6s}s | {(ratio or '-'):>5s} | "
+                f"{'ja' if gueltig else 'NEIN'}")
+            # Durchgang 1 ist der Übungsdurchgang und geht laut Protokoll nicht
+            # in die Wertung ein – er wird gespeichert, aber hier nicht gemittelt.
+            if gueltig and nr > 1:
+                gewertet.append((dauer, ratio))
+        if len(gewertet) >= 2:
+            zeiten = [d for d, _ in gewertet]
             zeilen.append("")
-            zeilen.append(f"  Mittel gueltiger Durchgaenge: {mittel:.1f} s "
-                          f"(bestes {min(gueltige):.1f} s, n={len(gueltige)})")
+            zeilen.append(f"  Mittel der gewerteten Durchgaenge (ab Nr. 2): "
+                          f"{sum(zeiten) / len(zeiten):.1f} s  (n={len(zeiten)})")
+            ratios = [float(r) for _, r in gewertet if r]
+            if ratios:
+                zeilen.append(f"  Mittleres Ratio rueckwaerts/vorwaerts: "
+                              f"{sum(ratios) / len(ratios):.3f}")
         self.tabelle_var.set("\n".join(zeilen))
 
     def close(self):
         if self._laeuft:
             # Ein laufender Durchgang darf nicht stillschweigend verschwinden.
             self._beenden(gueltig=False, notiz="verworfen (Fenster geschlossen)")
+        if self._eing_laeuft:
+            self._eing_beenden(abgebrochen=True)
         self._scroll.unbind_mousewheel()
         self.win.destroy()
 
