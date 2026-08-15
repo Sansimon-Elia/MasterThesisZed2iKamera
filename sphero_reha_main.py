@@ -4722,8 +4722,38 @@ def show_controller_ui():
     video_consent_var = tk.BooleanVar(value=False)
 
     # ── Haupt-Frame ────────────────────────────────────────────────────────────
-    main = ttk.Frame(root, padding=18)
-    main.pack(fill="both", expand=True)
+    # In einem Canvas + Scrollbar untergebracht, damit auf kleinen Laptop-
+    # Displays nichts verloren geht, wenn das Fenster nicht groß genug ist:
+    # Inhalt wird dann per Mausrad oder Scrollbar erreichbar statt abgeschnitten.
+    scroll_container = ttk.Frame(root)
+    scroll_container.pack(fill="both", expand=True)
+
+    main_canvas = tk.Canvas(scroll_container, highlightthickness=0)
+    main_scrollbar = ttk.Scrollbar(scroll_container, orient="vertical",
+                                    command=main_canvas.yview)
+    main_canvas.configure(yscrollcommand=main_scrollbar.set)
+    main_canvas.pack(side="left", fill="both", expand=True)
+    main_scrollbar.pack(side="right", fill="y")
+
+    main = ttk.Frame(main_canvas, padding=18)
+    main_window_id = main_canvas.create_window((0, 0), window=main, anchor="nw")
+
+    def _main_scrollregion_update(_event):
+        main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+    main.bind("<Configure>", _main_scrollregion_update)
+
+    def _canvas_width_update(event):
+        # main soll immer genau so breit sein wie der sichtbare Canvas-Bereich,
+        # sonst würden waagerechte fill="x"-Layouts bei Breitenänderung brechen.
+        main_canvas.itemconfigure(main_window_id, width=event.width)
+    main_canvas.bind("<Configure>", _canvas_width_update)
+
+    def _mausrad_scrollen(event):
+        main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    # Nur binden, solange die Maus über dem Canvas ist – sonst würde das
+    # Mausrad auch anderen Fenstern/Widgets das Scrollen wegnehmen.
+    main_canvas.bind("<Enter>", lambda _e: main_canvas.bind_all("<MouseWheel>", _mausrad_scrollen))
+    main_canvas.bind("<Leave>", lambda _e: main_canvas.unbind_all("<MouseWheel>"))
 
     ttk.Label(main, text="Sphero Reha-Controller",
               font=("Segoe UI", 16, "bold")).pack(anchor="w")

@@ -87,6 +87,7 @@ class VibrationBelt:
         self._schnittstelle = None      # Beschreibung für die Anzeige
         self._lock       = threading.Lock()
         self._status_text = "Gürtel aus"
+        self._je_verbunden = False   # wurde in diesem Verbindungsversuch je CONNECTED erreicht?
 
     # ── Zustand ───────────────────────────────────────────────────────────────
 
@@ -114,6 +115,7 @@ class VibrationBelt:
             return False
         self._stop.clear()
         self._verbunden.clear()
+        self._je_verbunden = False
         self._thread = threading.Thread(target=self._arbeite, daemon=True)
         self._thread.start()
         return True
@@ -229,6 +231,7 @@ class VibrationBelt:
                     pass
                 self._set_status(f"Gürtel verbunden ({self._schnittstelle}).")
                 self._on_event("belt_connected", self._schnittstelle)
+                self._je_verbunden = True
                 return True
 
         self._set_status("Gürtel nicht gefunden. Eingeschaltet? Kabel/Bluetooth prüfen.")
@@ -299,19 +302,24 @@ class VibrationBelt:
 
     def _trenne(self):
         ctrl, self._controller = self._controller, None
-        if ctrl is None:
+        if ctrl is not None:
+            try:
+                ctrl.stop_vibration(channel_index=1)
+            except Exception:
+                pass
+            try:
+                # Nicht blockierend trennen: Ein hängender Gürtel darf das
+                # Schließen der Anwendung nicht aufhalten.
+                ctrl.disconnect_belt(wait=False)
+            except Exception:
+                pass
+            self._on_event("belt_disconnected", self._schnittstelle or "")
+            self._schnittstelle = None
+
+        # War in diesem Versuch nie eine Verbindung zustande gekommen, steht in
+        # _status_text bereits der konkrete Grund (z.B. "nicht gefunden",
+        # "pybelt ist nicht installiert") – den wollen wir hier nicht mit dem
+        # nichtssagenden "Gürtel aus" überschreiben, sonst sieht der Nutzer nie,
+        # woran die Verbindung gescheitert ist.
+        if self._je_verbunden:
             self._set_status("Gürtel aus")
-            return
-        try:
-            ctrl.stop_vibration(channel_index=1)
-        except Exception:
-            pass
-        try:
-            # Nicht blockierend trennen: Ein hängender Gürtel darf das
-            # Schließen der Anwendung nicht aufhalten.
-            ctrl.disconnect_belt(wait=False)
-        except Exception:
-            pass
-        self._on_event("belt_disconnected", self._schnittstelle or "")
-        self._schnittstelle = None
-        self._set_status("Gürtel aus")
