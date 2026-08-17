@@ -31,6 +31,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from spherov2 import scanner
 from spherov2.sphero_edu import SpheroEduAPI
 from spherov2.types import Color
+# ToyUtil ist die Ebene UNTER SpheroEduAPI: ein Fahrbefehl, ein BLE-Paket.
+# Gebraucht für _SpheroDrive (siehe dort) – SpheroEduAPI.roll() schickt pro
+# Aufruf zwei Pakete und hält den Ball dazwischen an.
+from spherov2.utils import ToyUtil
 
 # Probandenverwaltung (pseudonymisierte Stammdaten + Eingabemaske)
 import probanden
@@ -139,6 +143,13 @@ latest_data = {
     "state": "neutral", "heading": 0,
     "backward_until": 0.0,
     "last_update": 0.0,   # time.time() der letzten echten Sensor-POST; 0.0 = noch nie
+    # Gemessene Frequenz der Steuerungsschleife. 0.0 = noch nicht gemessen.
+    # Steht hier, damit Anzeigen sie lesen können, ohne in die Steuerung
+    # hineinzugreifen. Bis zur Umstellung auf die zeitbasierte Drehrate hing die
+    # gefahrene Drehgeschwindigkeit unmittelbar an dieser Größe – sie war aber
+    # nirgends sichtbar, weshalb die Ursache des schwankenden Kurvenverhaltens
+    # lange nicht zu erkennen war.
+    "loop_hz": 0.0,
     # Zuletzt empfangene Herzfrequenz. 0.0 = die Uhr hat noch keinen Puls
     # geliefert (siehe valid_hr). Liegt hier und nicht nur im Graph-Puffer,
     # damit die Ruhepulsmessung sie ohne Umweg über die Anzeige lesen kann.
@@ -159,7 +170,7 @@ graph_time_values = deque(maxlen=MAX_POINTS)
 # gefahren werden kann, ohne dass am Code etwas geändert werden muss.
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
-TURN_SPEED_FACTOR    = 0.7
+TURN_SPEED_FACTOR    = 0.8
 
 # Handneigung, bei der das Höchsttempo erreicht ist (Hand weit nach unten
 # gekippt). Zusammen mit GX_FORWARD_MAX spannt dieser Wert die Tempo-Rampe auf:
@@ -188,15 +199,80 @@ GY_RIGHT_THRESHOLD   = -0.72
 GY_LEFT_THRESHOLD    = +0.60
 GX_FORWARD_MAX       = +0.1
 GX_NEUTRAL_THRESHOLD = +0.12
-# Maximaler Drehwinkel pro Schleifendurchlauf, getrennt je Seite.
+# Maximaler Drehwinkel je Lenkschritt, getrennt je Seite.
 # Getrennt, weil die Schwellen unterschiedlich sind: Rechts wird ab 0.80
 # gedreht, links schon ab 0.72. Der Winkel wird zwischen Schwelle und Vollaus-
 # schlag (1.0) hochskaliert – bei der niedrigeren linken Schwelle ist dieser
 # Bereich breiter (0.28 statt 0.20), sodass dieselbe Handdrehung links einen
 # deutlich größeren Winkel ergäbe. Ein kleinerer Maximalwinkel links gleicht
 # das wieder aus.
+#
+# "Je Lenkschritt" heißt seit der Umstellung auf die zeitbasierte Drehrate:
+# je LENK_BEZUGSTAKT_S Sekunden (siehe dort), NICHT mehr je tatsächlichem
+# Schleifendurchlauf.
 MAX_TURN_ANGLE_RIGHT = 60
 MAX_TURN_ANGLE_LEFT  = 60
+
+# ── Zeitbasierte Drehrate ────────────────────────────────────────────────────
+# Taktzeit, auf die sich MAX_TURN_ANGLE_* bezieht.
+#
+# Vorher wurde der Winkel einmal PRO SCHLEIFENDURCHLAUF aufaddiert. Die
+# tatsächlich gefahrene Drehrate war damit MAX_TURN_ANGLE mal Schleifenfrequenz –
+# und die hängt an Funkqualität und Rechenlast. Gemessen schwankte sie zwischen
+# rund 2,5 und 7 Durchläufen je Sekunde, die Drehrate bei gleicher Handhaltung
+# also um mehr als das Doppelte. Genau das war beim Testen als "erst dreht er
+# langsam, dann plötzlich viel mehr" aufgefallen, und zwar bei allen drei
+# Testpersonen.
+#
+# Jetzt wird mit der wirklich vergangenen Zeit skaliert:
+#
+#     Drehung = MAX_TURN_ANGLE * (dt / LENK_BEZUGSTAKT_S)
+#
+# Läuft die Schleife genau in diesem Takt, ist das Verhalten identisch zu
+# vorher. Läuft sie schneller oder langsamer, bleibt die Drehrate gleich.
+# Damit ist die Lenkung erstens für die Testperson vorhersagbar und zweitens
+# zwischen Sitzungen und Personen überhaupt erst vergleichbar – bisher steckte
+# die Tagesform des Laptops mit in der Messgröße.
+#
+# 0.22 s ist die gemessene mittlere Durchlaufzeit der ALTEN Schleife (zwei
+# quittierte BLE-Pakete je Durchlauf plus deren Sicherheitsabstände). Der Wert
+# ist deshalb so gewählt, dass die eingefahrene Abstimmung erhalten bleibt.
+# Kleiner = dreht insgesamt schneller, größer = gemächlicher.
+LENK_BEZUGSTAKT_S = 0.22
+
+# Obergrenze des Zeitfaktors dt / LENK_BEZUGSTAKT_S. Hängt die Schleife einmal
+# (Funkaussetzer, kurz blockierte Kamera), würde die "nachzuholende" Drehung
+# sonst als Sprung herauskommen – genau die ruckartige Bewegung, die abgestellt
+# werden soll. 2.0 heißt: höchstens die doppelte Drehung eines normalen Takts.
+LENK_MAX_ZEITFAKTOR = 2.0
+
+# Obergrenze der Kursänderung während EINER durchgehenden Handdrehung, in Grad.
+# 0 schaltet die Begrenzung ab.
+#
+# VOREINSTELLUNG 0 = AUS. Das war zwischenzeitlich anders, und warum es wieder
+# abgeschaltet wurde, ist der eigentlich lehrreiche Teil:
+#
+# Das Budget war als Gegenmittel gegen das Überdrehen eingeführt worden. Wer die
+# Hand weit gedreht hielt und wartete, bis sichtbar etwas geschah, hatte den Ball
+# gleich weit über das Ziel hinausgedreht – bei allen Testpersonen zu beobachten.
+# Die Ursache dafür war aber gar nicht die Ratensteuerung selbst, sondern die
+# schwankende Drehrate (siehe LENK_BEZUGSTAKT_S): Dieselbe Handhaltung drehte je
+# nach Rechenlast unterschiedlich schnell, also konnte niemand die nötige Dauer
+# abschätzen. Seit die Drehrate zeitbasiert und damit vorhersagbar ist, tritt das
+# Überdrehen nicht mehr auf – das Budget behandelte ein Symptom, dessen Ursache
+# inzwischen behoben ist.
+#
+# Es hatte dafür einen eigenen Preis: Bei einer Dauerkurve um ein Objekt hörte
+# der Ball nach der eingestellten Gradzahl auf zu drehen und fuhr geradeaus
+# weiter, obwohl die Hand noch gedreht war. Die Ratensteuerung verhielt sich in
+# dem Moment wie eine Positionssteuerung, und das ist genau die Eigenschaft, die
+# man bei der Wahl dieser Steuerungsart NICHT haben will.
+#
+# Der Regler bleibt erhalten: Für vorsichtige Testpersonen kann eine Begrenzung
+# weiterhin sinnvoll sein, und als Vergleichsgröße zwischen den Altersgruppen ist
+# sie interessant. Ist ein Budget gesetzt und aufgebraucht, wird die Kurvenfarbe
+# dunkler – so ist der Zustand ohne Erklärung erkennbar.
+LENK_MAX_DREHUNG = 0
 
 # ── Art der Kursführung ───────────────────────────────────────────────────────
 # "rate"     – Ratensteuerung (bisheriges und voreingestelltes Verhalten):
@@ -250,6 +326,9 @@ POS_MAX_OFFSET_RIGHT = 60
 # Anhaltswerte: 2.0 verdoppelt die Feinfühligkeit im unteren Drittel spürbar,
 # 3.0 macht Kurven sehr gut dosierbar, kostet aber Reaktionsschärfe beim
 # schnellen Wenden.
+#
+# In den Testfahrten hat sich 1.0 zusammen mit voller Tempo-Kopplung als gut
+# dosierbar erwiesen und ist deshalb die Vorgabe geblieben.
 LENK_EXPO = 1.0
 
 # Kopplung der Drehrate an das Fahrtempo, 0.0 = aus (bisheriges Verhalten).
@@ -267,7 +346,12 @@ LENK_EXPO = 1.0
 #
 # Zwischenwerte mischen beides. 0.7 lässt noch etwas Drehen im Stand zu, was
 # beim Rangieren auf engem Raum hilft.
-LENK_TEMPO_KOPPLUNG = 0.0
+#
+# VOREINSTELLUNG 1.0: In den Testfahrten war die volle Kopplung die Einstellung,
+# mit der sich Kurven am leichtesten treffen ließen – Tempo und Kurvenradius
+# passen dann von selbst zusammen, statt dass zum Kurvenfahren abgebremst
+# werden muss.
+LENK_TEMPO_KOPPLUNG = 1.0
 
 # ── Glättung der Handhaltung ─────────────────────────────────────────────────
 # Zeitkonstante eines Tiefpasses erster Ordnung auf gx und gy. 0 schaltet die
@@ -284,18 +368,17 @@ LENK_TEMPO_KOPPLUNG = 0.0
 # Empfindlichkeit der Schwellenlogik statt der Steuerleistung – genau in dem
 # Vergleich, um den es geht.
 #
-# VOREINSTELLUNG 0 = aus. Bewusst so gewählt: Das über die Testfahrten
-# eingefahrene Fahrverhalten bleibt damit die Bezugsgröße, gegen die alles
-# Neue verglichen wird. Die Glättung ist ein Angebot, das je Testperson
-# zugeschaltet und mitgespeichert wird – keine stillschweigende Änderung an
-# der Grundlage.
+# VOREINSTELLUNG 0.15 s: In den Testfahrten hat sich gezeigt, dass ohne
+# Glättung vor allem die Kurven unruhig werden. 0.15 s dämpft das Zittern
+# spürbar, ohne dass die Steuerung merklich hinterherhinkt, und ist deshalb der
+# neue Ausgangswert.
 #
 # Als Anhaltspunkt für das Einstellen: 0,15 s bedeutet, dass eine sprunghafte
 # Änderung der Handhaltung nach etwa einer Zeitkonstante zu 63 % übernommen
 # ist, nach drei zu 95 %. Bei rund 100 ms Zykluszeit bleibt die Steuerung damit
 # deutlich schneller als die menschliche Reaktion, während Zittern im Bereich
 # mehrerer Hertz stark gedämpft wird (gemessen: auf 22 % der Schwankungsbreite).
-GLAETTUNG_TAU_S = 0.0
+GLAETTUNG_TAU_S = 0.15
 
 # ── Hysterese der Kippschwellen ──────────────────────────────────────────────
 # Zusatzweg, den die Hand zurücklegen muss, um einen Dreh- oder Fahrzustand
@@ -307,27 +390,65 @@ GLAETTUNG_TAU_S = 0.0
 # Absicht abbilden. Mit getrennter Ein- und Ausstiegsschwelle entsteht ein
 # Halteband (Schmitt-Trigger) – dieselbe Lösung wie in jedem Thermostat.
 #
-# VOREINSTELLUNG 0 = aus, aus demselben Grund wie bei der Glättung: Das alte
-# Fahrverhalten bleibt die Basis. Erprobte Werte zum Zuschalten sind 0,05 für
-# die Drehung und 0,03 fürs Fahren; zusammen mit einer Glättung von 0,15 s
-# sanken die Zustandswechsel bei ruhig an der Schwelle gehaltener Hand im Test
-# von 121 auf 2 in zehn Sekunden.
-GY_HYSTERESE = 0.0
+# VOREINSTELLUNG: 0,12 für die Drehung, 0 fürs Fahren – in dieser Kombination
+# ließen sich die Kurven in den Testfahrten am besten halten. Zusammen mit einer
+# Glättung von 0,15 s sanken die Zustandswechsel bei ruhig an der Schwelle
+# gehaltener Hand im Test von 121 auf 2 in zehn Sekunden.
+#
+# Das Halteband beim Fahren bleibt bei 0: Ein Anheben der Hand soll den Ball
+# ohne Zusatzweg anhalten – das ist die Notbremse der Testperson.
+GY_HYSTERESE = 0.12
 GX_HYSTERESE = 0.0
 
 # ── Reaktionsgeschwindigkeit der Steuerung ────────────────────────────────────
-# Ein Schleifendurchlauf dauert ungefähr ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP,
-# denn sphero.roll() schläft die angegebene Dauer selbst ab. Kleinere Werte
-# heißt: der Sphero setzt Änderungen der Handhaltung schneller um.
-# ACHTUNG, das ist ein Kompromiss: jeder Durchlauf sendet zwei quittierte
-# BLE-Befehle (roll + internes stop_roll). Kürzere Zeiten erhöhen also die
-# Funklast – und hohe Funklast ist genau das, was die Verbindung im
-# Kamerabetrieb abreißen lässt. Gemessen:
-#     0.10 / 0.05  ->  ~150 ms je Durchlauf, ~13 Befehle/s   (Ursprungswerte)
-#     0.07 / 0.04  ->  ~110 ms je Durchlauf, ~18 Befehle/s
-#     0.06 / 0.04  ->  ~100 ms je Durchlauf, ~20 Befehle/s   (jetzt eingestellt)
-# ERSTE MASSNAHME, falls die Verbindung wieder instabil wird: hier zurück auf
-# 0.1 und 0.05. Das kostet Reaktionsschnelligkeit, aber nichts an der Funktion.
+# ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP ist der ANGESTREBTE Takt eines
+# Schleifendurchlaufs. Die Schleife misst, wie lange ihre Arbeit gedauert hat,
+# und schläft nur den Rest ab; braucht ein Funkbefehl ausnahmsweise länger,
+# entfällt die Pause ganz.
+#
+# Früher stand hier etwas anderes: sphero.roll() schlief ROLL_COMMAND_DURATION
+# selbst ab UND schickte danach von sich aus einen Stopp-Befehl. Ein Durchlauf
+# kostete damit zwei quittierte BLE-Pakete samt der 75 ms Sicherheitsabstand,
+# die spherov2 nach jedem Paket einlegt – gemessen 220 bis 330 ms statt der
+# erhofften 100 ms. Der Ball fuhr außerdem 60 ms und stand dann wieder still,
+# was das Ruckeln erzeugt hat.
+#
+# Seit _SpheroDrive geht je Durchlauf höchstens EIN Paket raus, und nur wenn
+# sich Kurs oder Tempo wirklich geändert haben. Der Takt unten ist deshalb
+# tatsächlich erreichbar.
+#
+# ERSTE MASSNAHME, falls die Verbindung instabil wird: hier zurück auf 0.10 und
+# 0.05 und SPHERO_CMD_INTERVAL_S wieder auf 0.075. Das kostet
+# Reaktionsschnelligkeit, aber nichts an der Funktion.
+
+# Sicherheitsabstand zwischen zwei BLE-Paketen. spherov2 legt hier für den BOLT
+# fest 0.075 s an (types.py, ToyType.cmd_safe_interval) und schläft diese Zeit
+# im Sendethread nach JEDEM Paket ab – bei zwei Paketen je Durchlauf waren das
+# allein 150 ms Grundlast. Da jetzt deutlich weniger Pakete anfallen, ist ein
+# kürzerer Abstand vertretbar und macht die Steuerung spürbar direkter.
+# Wird beim Verbinden auf die Toy-Instanz gesetzt (siehe control_sphero).
+SPHERO_CMD_INTERVAL_S = 0.04
+
+# ── Fahrbefehle nur bei Änderung senden ──────────────────────────────────────
+# Ein wiederholtes "fahre Kurs 90 mit Tempo 60" ändert am Ball nichts, kostet
+# aber ein Paket samt Antwort und Sicherheitsabstand. Bei Geradeausfahrt mit
+# ruhiger Hand ist das jeder einzelne Durchlauf. Unterhalb dieser Schwellen
+# gilt ein Befehl als unverändert und wird übersprungen.
+#
+# WICHTIG: Das bremst nichts aus. Sobald sich die Handhaltung ändert – tiefer
+# gesenkt heißt anderes Tempo, gedreht heißt anderer Kurs – liegt die Änderung
+# über der Schwelle und das Paket geht sofort raus. Übersprungen wird nur, was
+# ohnehin keine Wirkung hätte. Der freie Funkkanal kommt dann genau den
+# Befehlen zugute, die etwas ändern.
+DRIVE_MIN_HEADING_DELTA = 2      # Grad
+DRIVE_MIN_SPEED_DELTA   = 3      # Sphero-Tempoeinheiten
+
+# Spätestens nach dieser Zeit wird derselbe Fahrbefehl trotzdem wiederholt.
+# Absicherung gegen ein einzelnes verlorenes Paket: Ginge ausgerechnet der
+# letzte Befehl vor einer langen ruhigen Geradeausfahrt verloren, führe der Ball
+# sonst bis zur nächsten Handbewegung mit dem alten Kurs weiter.
+DRIVE_KEEPALIVE_S = 0.5
+
 # ── Tragearm der Apple Watch ─────────────────────────────────────────────────
 # Wird die Uhr auf den anderen Arm gewechselt und dabei gedreht (Krone zeigt
 # dann in die andere Richtung entlang des Unterarms), liegt das Gerät um 180°
@@ -350,8 +471,8 @@ WATCH_ARM_LEFT  = "links"
 WATCH_ARM_RIGHT = "rechts"
 watch_arm = WATCH_ARM_LEFT        # zur Laufzeit über die Oberfläche umschaltbar
 
-ROLL_COMMAND_DURATION = 0.06   # Sekunden, die roll() intern wartet
-CONTROL_LOOP_SLEEP    = 0.04   # Sekunden Pause am Ende jedes Durchlaufs
+ROLL_COMMAND_DURATION = 0.06   # Sekunden – Hauptanteil des angestrebten Takts
+CONTROL_LOOP_SLEEP    = 0.04   # Sekunden – Restanteil des angestrebten Takts
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
 BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
 DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine Daten", bleibt stehen
@@ -371,9 +492,11 @@ DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine
 # bekannten Ausgangsverhalten: Wer sich verstellt hat, kommt mit einem Klick
 # exakt dorthin zurück, statt einzelne Regler von Hand zurücksuchen zu müssen.
 #
-# "Standard" bildet das über die Testfahrten eingefahrene Verhalten 1:1 ab
-# (Ratensteuerung, keine Glättung, keine Hysterese) und ist damit die
-# Bezugsgröße, gegen die alles Neue verglichen wird.
+# "Standard" bildet den über die Testfahrten eingefahrenen Stand 1:1 ab und ist
+# damit die Bezugsgröße, gegen die alles Neue verglichen wird. Der Inhalt hat
+# sich mit den Testfahrten geändert: Glättung, Halteband der Drehung und volle
+# Tempo-Kopplung gehören inzwischen dazu, weil sich damit die Kurven deutlich
+# besser dosieren ließen.
 #
 # Die Zahlen sind aus Testfahrten abgeleitet und keine normierten Stufen. Für
 # die Auswertung zählt nicht der Profilname, sondern die tatsächlich gefahrene
@@ -390,19 +513,23 @@ FAHRPROFILE = {
         "POS_MAX_OFFSET_LEFT": 45, "POS_MAX_OFFSET_RIGHT": 45,
         "GLAETTUNG_TAU_S": 0.20, "GY_HYSTERESE": 0.06, "GX_HYSTERESE": 0.04,
         "LENK_EXPO": 2.5, "LENK_TEMPO_KOPPLUNG": 0.7,
+        # Auch hier kein Budget: Es hat sich beim Fahren als hinderlicher
+        # erwiesen als hilfreich (Begründung bei LENK_MAX_DREHUNG). Wer es
+        # ausprobieren will, stellt es am Regler ein.
+        "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
     },
-    # Entspricht exakt dem Fahrverhalten vor Einführung von Glättung,
-    # Hysterese und Positionssteuerung.
+    # Der in den Testfahrten eingefahrene Stand.
     "Standard": {
         "MIN_SPEED_DYN": 30, "MAX_SPEED_DYN": 120,
-        "TURN_SPEED_FACTOR": 0.7,
+        "TURN_SPEED_FACTOR": 0.8,
         "MAX_TURN_ANGLE_LEFT": 60, "MAX_TURN_ANGLE_RIGHT": 60,
         "ROLL_COMMAND_DURATION": 0.06, "STOP_TIME": 0.6,
         "BACKWARD_SPEED": 80,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 60, "POS_MAX_OFFSET_RIGHT": 60,
-        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
-        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 0.0,
+        "GLAETTUNG_TAU_S": 0.15, "GY_HYSTERESE": 0.12, "GX_HYSTERESE": 0.0,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
+        "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
     },
     "Sportlich": {
         "MIN_SPEED_DYN": 45, "MAX_SPEED_DYN": 200,
@@ -414,6 +541,7 @@ FAHRPROFILE = {
         "POS_MAX_OFFSET_LEFT": 75, "POS_MAX_OFFSET_RIGHT": 75,
         "GLAETTUNG_TAU_S": 0.05, "GY_HYSTERESE": 0.02, "GX_HYSTERESE": 0.01,
         "LENK_EXPO": 1.8, "LENK_TEMPO_KOPPLUNG": 0.5,
+        "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
     },
 }
 
@@ -454,6 +582,8 @@ def fahrverhalten_werte() -> dict:
         "POS_MAX_OFFSET_RIGHT": POS_MAX_OFFSET_RIGHT,
         "LENK_EXPO": LENK_EXPO,
         "LENK_TEMPO_KOPPLUNG": LENK_TEMPO_KOPPLUNG,
+        "LENK_BEZUGSTAKT_S": LENK_BEZUGSTAKT_S,
+        "LENK_MAX_DREHUNG": LENK_MAX_DREHUNG,
     }
 
 
@@ -481,6 +611,8 @@ FAHRWERT_GRENZEN = {
     "POS_MAX_OFFSET_RIGHT":  (10, 180),
     "LENK_EXPO":             (1.0, 4.0),
     "LENK_TEMPO_KOPPLUNG":   (0.0, 1.0),
+    "LENK_BEZUGSTAKT_S":     (0.05, 0.40),
+    "LENK_MAX_DREHUNG":      (0, 360),
 }
 
 # STEUERMODUS ist keine Zahl und wird deshalb getrennt geprüft.
@@ -490,6 +622,7 @@ _FAHRWERT_GANZZAHLIG = {
     "MIN_SPEED_DYN", "MAX_SPEED_DYN", "MAX_TURN_ANGLE_LEFT",
     "MAX_TURN_ANGLE_RIGHT", "BACKWARD_SPEED",
     "POS_MAX_OFFSET_LEFT", "POS_MAX_OFFSET_RIGHT",
+    "LENK_MAX_DREHUNG",
 }
 
 
@@ -513,6 +646,7 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     global GLAETTUNG_TAU_S, GY_HYSTERESE, GX_HYSTERESE
     global STEUERMODUS, POS_MAX_OFFSET_LEFT, POS_MAX_OFFSET_RIGHT
     global LENK_EXPO, LENK_TEMPO_KOPPLUNG
+    global LENK_BEZUGSTAKT_S, LENK_MAX_DREHUNG
     global fahrprofil_name
 
     if not isinstance(werte, dict):
@@ -557,6 +691,8 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     POS_MAX_OFFSET_RIGHT  = geprueft.get("POS_MAX_OFFSET_RIGHT", POS_MAX_OFFSET_RIGHT)
     LENK_EXPO             = round(geprueft.get("LENK_EXPO", LENK_EXPO), 2)
     LENK_TEMPO_KOPPLUNG   = round(geprueft.get("LENK_TEMPO_KOPPLUNG", LENK_TEMPO_KOPPLUNG), 2)
+    LENK_BEZUGSTAKT_S     = round(geprueft.get("LENK_BEZUGSTAKT_S", LENK_BEZUGSTAKT_S), 3)
+    LENK_MAX_DREHUNG      = geprueft.get("LENK_MAX_DREHUNG", LENK_MAX_DREHUNG)
 
     # Unbekannte Bezeichnung übergehen statt übernehmen: Ein Tippfehler in der
     # Datei darf nicht dazu führen, dass die Steuerung in keinem der beiden
@@ -789,16 +925,27 @@ def _drehanteil(gy_value) -> float:
     return anteil if LENK_EXPO == 1.0 else anteil ** LENK_EXPO
 
 
-def calc_turn(gy_value, tempo=None) -> float:
+def calc_turn(gy_value, tempo=None, dt=None) -> float:
     """
-    Ratensteuerung: Drehwinkel PRO SCHLEIFENDURCHLAUF, 0° an der Kippschwelle
-    bis MAX_TURN_ANGLE bei voller Kippung. Wird fortlaufend auf den Kurs
-    aufaddiert, solange die Hand gedreht bleibt.
+    Ratensteuerung: Drehwinkel je Lenkschritt, 0° an der Kippschwelle bis
+    MAX_TURN_ANGLE bei voller Kippung. Wird fortlaufend auf den Kurs aufaddiert,
+    solange die Hand gedreht bleibt.
 
     `tempo` ist das gerade gefahrene Tempo. Es wird nur gebraucht, wenn die
     Drehrate ans Tempo gekoppelt ist (LENK_TEMPO_KOPPLUNG > 0): Dann ergibt eine
     gehaltene Handstellung einen Kreis mit festem Radius statt einer festen
     Drehgeschwindigkeit. Ohne Angabe bleibt die Kopplung wirkungslos.
+
+    `dt` ist die seit dem letzten Lenkschritt tatsächlich vergangene Zeit. Damit
+    wird MAX_TURN_ANGLE von "je Durchlauf" auf "je LENK_BEZUGSTAKT_S Sekunden"
+    umgerechnet – siehe die ausführliche Begründung bei LENK_BEZUGSTAKT_S.
+    Ohne Angabe (Vorschau in der Oberfläche) wird der Bezugstakt selbst
+    eingesetzt, die Funktion liefert dann den unskalierten Winkel je Takt.
+
+    Der Zeitfaktor ist nach oben begrenzt: Bleibt die Schleife einmal länger
+    hängen (Funkaussetzer, Kamera blockiert kurz), soll die Nachholdrehung nicht
+    als Sprung herauskommen. Lieber einmal etwas zu wenig gedreht als der Ball
+    plötzlich quer.
     """
     max_winkel = MAX_TURN_ANGLE_LEFT if gy_value > 0 else MAX_TURN_ANGLE_RIGHT
     winkel     = _drehanteil(gy_value) * max_winkel
@@ -810,6 +957,10 @@ def calc_turn(gy_value, tempo=None) -> float:
         bezug  = max(1.0, MAX_SPEED_DYN * TURN_SPEED_FACTOR)
         anteil = max(0.0, min(1.0, float(tempo) / bezug))
         winkel *= (1.0 - LENK_TEMPO_KOPPLUNG) + LENK_TEMPO_KOPPLUNG * anteil
+
+    takt = LENK_BEZUGSTAKT_S if LENK_BEZUGSTAKT_S > 1e-6 else 0.22
+    if dt is not None:
+        winkel *= max(0.0, min(float(dt) / takt, LENK_MAX_ZEITFAKTOR))
     return winkel
 
 
@@ -1433,6 +1584,16 @@ class SessionRecorder:
                 "POS_MAX_OFFSET_RIGHT": POS_MAX_OFFSET_RIGHT,
                 "LENK_EXPO": LENK_EXPO,
                 "LENK_TEMPO_KOPPLUNG": LENK_TEMPO_KOPPLUNG,
+                # Zeitbezug der Drehrate. Unverzichtbar für die Auswertung:
+                # MAX_TURN_ANGLE_* allein sagt nichts mehr über die gefahrene
+                # Drehgeschwindigkeit aus, erst zusammen mit dieser Zeitspanne.
+                "LENK_BEZUGSTAKT_S": LENK_BEZUGSTAKT_S,
+                "LENK_MAX_DREHUNG": LENK_MAX_DREHUNG,
+                # Funkverhalten der Fahrbefehle – bestimmt mit, wie direkt die
+                # Steuerung in dieser Sitzung reagiert hat.
+                "SPHERO_CMD_INTERVAL_S": SPHERO_CMD_INTERVAL_S,
+                "DRIVE_MIN_HEADING_DELTA": DRIVE_MIN_HEADING_DELTA,
+                "DRIVE_MIN_SPEED_DELTA": DRIVE_MIN_SPEED_DELTA,
             },
             # Die Herzfrequenzzonen sind personenabhängig und werden aus Alter
             # und (falls gemessen) Ruhepuls berechnet. Ohne diese Angaben wäre
@@ -1652,6 +1813,25 @@ def _is_connection_error(exc: Exception) -> bool:
 SPHERO_CMD_TIMEOUT = 1.5   # Sekunden – eigene Obergrenze pro Sphero-Befehl
 
 
+class _BefehlUeberlastet(Exception):
+    """
+    Ein Befehl kam nicht in SPHERO_CMD_TIMEOUT durch – die Verbindung selbst ist
+    aber nicht als tot erwiesen.
+
+    Warum das eine eigene Ausnahme braucht: Bisher warf der Wächter
+    concurrent.futures.TimeoutError, und _is_connection_error() wertet genau die
+    als Verbindungsabbruch. Ein langsamer Durchlauf – Laptop wird warm und
+    drosselt, USB3 der Kamera stört ins 2,4-GHz-Band, Funkkanal kurz voll –
+    sah damit exakt aus wie ein Abriss. Nach drei solchen Durchläufen hat die
+    Steuerung eine völlig intakte Verbindung abgebaut und einen Reconnect-Zyklus
+    von mehreren Sekunden begonnen; der Sphero stand in dieser Zeit still.
+
+    Getrennt geführt, kann die Schleife den Durchlauf einfach überspringen und
+    weiterarbeiten. Erst wenn es viele Male hintereinander passiert, ist es doch
+    ein Abriss (siehe MAX_CONSECUTIVE_OVERLOAD).
+    """
+
+
 class _SpheroCommandGuard:
     """
     Führt Sphero-Befehle mit selbst gesetztem, kurzem Timeout aus und stellt
@@ -1679,7 +1859,7 @@ class _SpheroCommandGuard:
 
     def call(self, func, *args, timeout=SPHERO_CMD_TIMEOUT, **kwargs):
         if not self._busy.acquire(timeout=timeout):
-            raise concurrent.futures.TimeoutError(
+            raise _BefehlUeberlastet(
                 f"Voriger Sphero-Befehl hängt noch – {getattr(func, '__name__', func)} übersprungen"
             )
         result = {}
@@ -1696,12 +1876,129 @@ class _SpheroCommandGuard:
         t.start()
         t.join(timeout)
         if t.is_alive():
-            raise concurrent.futures.TimeoutError(
+            # Eigenes Zeitlimit gerissen. Das ist eine Aussage über UNSERE
+            # Wartebereitschaft, nicht über den Zustand der Verbindung – deshalb
+            # _BefehlUeberlastet und nicht TimeoutError (siehe dort).
+            raise _BefehlUeberlastet(
                 f"Sphero-Befehl {getattr(func, '__name__', func)} antwortet nicht innerhalb {timeout}s"
             )
         if "error" in result:
             raise result["error"]
         return result.get("value")
+
+
+class _SpheroDrive:
+    """
+    Fahrbefehle an den Sphero – ein Befehl, ein BLE-Paket, und nur wenn er etwas
+    ändert.
+
+    Warum diese Schicht überhaupt existiert. SpheroEduAPI.roll(kurs, tempo,
+    dauer) ist bequem, aber für eine laufende Steuerung falsch gebaut
+    (spherov2/sphero_edu.py):
+
+        roll_start(...)  ->  time.sleep(dauer)  ->  stop_roll()
+
+    Jeder Aufruf hält den Ball am Ende also wieder an. Bei einer Schleife, die
+    zehnmal je Sekunde einen Fahrbefehl schickt, heißt das: fahren, stoppen,
+    fahren, stoppen. Genau daher kam das Ruckeln – es war kein Funkproblem,
+    sondern der Ball hat getan, was ihm gesagt wurde.
+
+    Dazu kommt der Preis in Zeit. spherov2 wartet nach JEDEM Paket
+    cmd_safe_interval ab (BOLT: 75 ms) und blockiert zusätzlich, bis der Ball
+    das Paket quittiert hat. Zwei Pakete je Durchlauf ergaben gemessen 220 bis
+    330 ms – die Steuerung lief also mit 3 bis 4,5 Hz statt der eingestellten
+    10 Hz, und weil MAX_TURN_ANGLE früher je DURCHLAUF galt, hing die
+    Drehgeschwindigkeit unmittelbar an dieser schwankenden Rate.
+
+    Diese Klasse geht deshalb eine Ebene tiefer, auf ToyUtil.roll_start: ein
+    einziges drive_with_heading-Paket, das Kurs und Tempo gemeinsam setzt und
+    den Ball weiterfahren lässt, bis etwas anderes gesagt wird. Angehalten wird
+    nur noch, wenn wirklich angehalten werden soll.
+
+    Zusätzlich wird ein Befehl übersprungen, der nichts ändert (gleicher Kurs,
+    gleiches Tempo). Das kostet keine Reaktionsschnelligkeit – ändert sich die
+    Handhaltung, ändert sich sofort Kurs oder Tempo und das Paket geht raus –,
+    hält den Funkkanal aber frei für die Befehle, die tatsächlich etwas tun.
+
+    Der interne Zustand von SpheroEduAPI (__heading/__speed) wird dabei
+    mitgeführt. Sonst hätten die Stellen, die weiterhin die normale API
+    benutzen – Ausrichten, Rückwärtsfahrt, Abschalten – einen veralteten Stand
+    und würden mit einem falschen Kurs oder Tempo weiterarbeiten.
+    """
+
+    def __init__(self, api, guard):
+        self._api      = api
+        self._guard    = guard
+        self._toy      = getattr(api, "_SpheroEduAPI__toy", None)
+        self._last     = None    # zuletzt gesendetes (kurs, tempo)
+        self._last_t   = 0.0
+        self.pakete    = 0       # gesendete Fahrpakete (für die Taktanzeige)
+        self.uebersprungen = 0
+
+    def _roh_senden(self, kurs: int, tempo: int):
+        """Ein Fahrpaket, ohne Änderungsprüfung."""
+        if self._toy is None:
+            # Ältere oder abweichende spherov2-Fassung: kein Zugriff auf die
+            # Toy-Instanz. Dann über die öffentliche API – das sind zwei Pakete
+            # statt einem, funktioniert aber. Lieber langsamer als gar nicht.
+            self._guard.call(self._api.set_heading, kurs)
+            self._guard.call(self._api.set_speed, tempo)
+            return
+        # Den mitgeführten Zustand der API gleich mitschreiben, damit
+        # stop_roll() und die Rückwärtsfahrt denselben Kurs sehen.
+        self._api._SpheroEduAPI__heading = kurs
+        self._api._SpheroEduAPI__speed   = tempo
+        self._guard.call(ToyUtil.roll_start, self._toy, kurs, tempo)
+
+    def fahre(self, kurs, tempo) -> bool:
+        """
+        Fahrbefehl absetzen, sofern er etwas ändert.
+
+        Rückgabe: True, wenn tatsächlich gesendet wurde.
+        """
+        kurs  = int(kurs) % 360
+        tempo = int(tempo)
+        jetzt = time.time()
+
+        if self._last is not None:
+            alt_kurs, alt_tempo = self._last
+            # Kursdifferenz über den kürzeren Weg, damit 359 -> 1 als 2 Grad
+            # zählt und nicht als 358.
+            d_kurs  = abs((kurs - alt_kurs + 180) % 360 - 180)
+            d_tempo = abs(tempo - alt_tempo)
+            frisch  = (jetzt - self._last_t) < DRIVE_KEEPALIVE_S
+            if (d_kurs < DRIVE_MIN_HEADING_DELTA
+                    and d_tempo < DRIVE_MIN_SPEED_DELTA and frisch):
+                self.uebersprungen += 1
+                return False
+
+        self._roh_senden(kurs, tempo)
+        self._last   = (kurs, tempo)
+        self._last_t = jetzt
+        self.pakete += 1
+        return True
+
+    def halte(self, kurs):
+        """
+        Anhalten. Anders als fahre() immer gesendet, nie übersprungen: Ein
+        nicht ausgeführter Stopp ist der eine Fehler, den diese Steuerung sich
+        nicht leisten darf.
+        """
+        kurs = int(kurs) % 360
+        self._roh_senden(kurs, 0)
+        self._last   = (kurs, 0)
+        self._last_t = time.time()
+        self.pakete += 1
+
+    def vergiss(self):
+        """
+        Zwischenspeicher verwerfen – nach dem Ausrichten oder der
+        Rückwärtsfahrt. Dort haben andere Stellen gefunkt, der Ball steht also
+        möglicherweise nicht mehr auf dem hier vermerkten Stand. Ohne dieses
+        Verwerfen könnte der nächste Fahrbefehl als "unverändert" durchfallen
+        und der Ball bliebe stehen.
+        """
+        self._last = None
 
 
 class _SpheroAPIFastClose(SpheroEduAPI):
@@ -1786,6 +2083,27 @@ vibrationsguertel = guertel.VibrationBelt(
 )
 
 
+def _takt_warten(schritt_start: float):
+    """
+    Den angestrebten Takt eines Schleifendurchlaufs einhalten.
+
+    Gewartet wird nur die RESTZEIT bis ROLL_COMMAND_DURATION +
+    CONTROL_LOOP_SLEEP, nicht diese Zeit zusätzlich zur geleisteten Arbeit.
+    Der Unterschied ist wesentlich: Früher schlief die Schleife eine feste
+    Pause ab, obwohl der Fahrbefehl davor schon 200 ms gedauert hatte – der
+    Takt war damit weder eingestellt noch gemessen, sondern das zufällige
+    Ergebnis aus Funklaufzeit plus Pause.
+
+    Dauerte die Arbeit länger als der Takt, wird gar nicht gewartet: Der
+    nächste Durchlauf soll dann sofort beginnen, damit die Steuerung der Hand
+    so schnell wie möglich wieder folgt.
+    """
+    ziel = ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP
+    rest = ziel - (time.time() - schritt_start)
+    if rest > 0:
+        time.sleep(rest)
+
+
 def control_sphero():
     global sphero_api
 
@@ -1805,6 +2123,13 @@ def control_sphero():
     # wieder normal reagiert. Erst nach mehreren Fehlversuchen in Folge gilt
     # die Verbindung als wirklich verloren (→ voller Reconnect-Zyklus).
     MAX_CONSECUTIVE_FAILURES = 3
+
+    # Für Überlastfälle (_BefehlUeberlastet) gilt eine eigene, deutlich höhere
+    # Grenze. Ein zu langsamer Durchlauf ist kein Verbindungsabbruch: Der Ball
+    # fährt mit dem letzten Befehl weiter, und der nächste Durchlauf kommt in
+    # 100 ms. Bei acht in Folge steht die Verbindung aber offensichtlich doch
+    # nicht mehr – dann greift der normale Reconnect.
+    MAX_CONSECUTIVE_OVERLOAD = 8
 
     while not stop_sphero.is_set() and reconnect_count <= MAX_RECONNECTS:
 
@@ -1852,6 +2177,17 @@ def control_sphero():
             time.sleep(RECONNECT_DELAY)
             continue
 
+        # Sicherheitsabstand zwischen zwei BLE-Paketen herabsetzen. spherov2
+        # schläft diese Zeit im Sendethread nach jedem Paket ab; der
+        # Vorgabewert des BOLT (75 ms) war der größte Einzelposten in der
+        # Durchlaufzeit. Gesetzt wird nur auf DIESER Toy-Instanz – die
+        # Klassenvorgabe der Bibliothek bleibt unangetastet.
+        try:
+            toy.toy_type = toy.toy_type._replace(
+                cmd_safe_interval=SPHERO_CMD_INTERVAL_S)
+        except Exception as e:
+            print(f"[WARN] Paketabstand nicht setzbar, Vorgabe bleibt: {e}")
+
         # ── Steuerungs-Loop ───────────────────────────────────────────────────
         connection_lost = False
         try:
@@ -1860,9 +2196,24 @@ def control_sphero():
                 last_move_time       = time.time()
                 is_stopped           = True
                 consecutive_failures = 0
+                consecutive_overload = 0
                 was_backward         = False
                 guard                = _SpheroCommandGuard()
+                drive                = _SpheroDrive(sphero, guard)
                 current_led          = None
+                # Zeitpunkt des vorigen Lenkschritts – Grundlage der
+                # zeitbasierten Drehrate (siehe LENK_BEZUGSTAKT_S).
+                letzter_schritt      = time.time()
+                # Bereits verbrauchtes Dreh-Budget der laufenden Handdrehung,
+                # mit Vorzeichen (siehe LENK_MAX_DREHUNG). Wird zurückgesetzt,
+                # sobald die Hand die Drehstellung verlässt.
+                dreh_budget          = 0.0
+                budget_erschoepft    = False
+                # Messung der tatsächlich erreichten Schleifenfrequenz. Sie war
+                # bisher unbekannt und ist genau die Größe, an der die Lenkung
+                # hing – deshalb wird sie angezeigt und protokolliert.
+                takt_mittel          = 0.0
+                takt_letzte_meldung  = time.time()
 
                 def set_led(r, g, b):
                     # LED nur bei Farbwechsel senden – vorher wurde dieselbe
@@ -1885,6 +2236,8 @@ def control_sphero():
                 reconnect_count = 0  # bei Erfolg zurücksetzen
 
                 while not stop_sphero.is_set():
+                    schritt_start = time.time()
+
                     # ── Ausrichten: Sphero an die Oberfläche abgeben ──────────
                     # Solange ausgerichtet wird, darf diese Schleife nichts
                     # senden. Zwei gleichzeitige Befehlsströme auf derselben
@@ -1912,7 +2265,12 @@ def control_sphero():
                             guard.call(sphero.set_heading, sphero_heading)
                         except Exception:
                             pass
-                        last_move_time = time.time()
+                        # Während des Ausrichtens hat die Oberfläche gefunkt –
+                        # der zwischengespeicherte Fahrbefehl gilt nicht mehr.
+                        drive.vergiss()
+                        last_move_time  = time.time()
+                        letzter_schritt = time.time()
+                        dreh_budget     = 0.0
                         continue
 
                     with data_lock:
@@ -1933,17 +2291,26 @@ def control_sphero():
                                 # in den Motoren, die (v.a. bei schwächerem
                                 # Akku) die Versorgungsspannung einbrechen
                                 # und die BLE-Verbindung abreißen lassen kann.
-                                guard.call(sphero.stop_roll, int(sphero_heading))
+                                drive.halte(sphero_heading)
                                 set_led(160, 0, 255)
                                 time.sleep(0.3)
                                 was_backward = True
                             backward_heading = (sphero_heading + 180) % 360
-                            guard.call(sphero.roll, int(backward_heading), BACKWARD_SPEED,
-                                       ROLL_COMMAND_DURATION)
+                            # Auch rückwärts über drive(): ein Paket, kein
+                            # Stopp am Ende. Der Ball rollt gleichmäßig zurück,
+                            # statt in der Rückwärtsfahrt zu stottern.
+                            drive.fahre(backward_heading, BACKWARD_SPEED)
                             set_led(160, 0, 255)
                             last_move_time = time.time()
                             is_stopped     = False
                             consecutive_failures = 0
+                            consecutive_overload = 0
+                        except _BefehlUeberlastet as e:
+                            consecutive_overload += 1
+                            if consecutive_overload >= MAX_CONSECUTIVE_OVERLOAD:
+                                connection_lost = True
+                                break
+                            print(f"[WARN] Rückwärts-Befehl zu langsam ({consecutive_overload}/{MAX_CONSECUTIVE_OVERLOAD}): {e}")
                         except Exception as e:
                             if _is_connection_error(e):
                                 consecutive_failures += 1
@@ -1954,9 +2321,18 @@ def control_sphero():
                             else:
                                 print(f"[WARN] Rückwärts-Befehl fehlgeschlagen: {e}")
                         recorder.log_control(gx, gy, gz, "backward", sphero_heading, BACKWARD_SPEED, False)
-                        time.sleep(CONTROL_LOOP_SLEEP)
+                        # Nach der Rückwärtsfahrt beginnt die Handsteuerung neu:
+                        # weder ein altes Dreh-Budget noch die Zeit seit dem
+                        # letzten Lenkschritt dürfen mitgeschleppt werden.
+                        letzter_schritt = time.time()
+                        dreh_budget     = 0.0
+                        _takt_warten(schritt_start)
                         continue
 
+                    if was_backward:
+                        # Der Ball fuhr eben noch rückwärts; der gemerkte
+                        # Fahrbefehl passt nicht mehr zur neuen Richtung.
+                        drive.vergiss()
                     was_backward = False
 
                     # ── Ohne frische Sensordaten von Handy/Watch nichts fahren ──────
@@ -1972,6 +2348,12 @@ def control_sphero():
                     state         = "neutral" if data_is_stale else gemessener_zustand
                     applied_speed = 0
 
+                    # Tatsächlich vergangene Zeit seit dem letzten Lenkschritt.
+                    # Sie ersetzt die frühere stillschweigende Annahme, jeder
+                    # Durchlauf sei gleich lang – siehe LENK_BEZUGSTAKT_S.
+                    dt              = schritt_start - letzter_schritt
+                    letzter_schritt = schritt_start
+
                     try:
                         if state in ("right", "left"):
                             applied_speed = int(calc_speed(gx) * TURN_SPEED_FACTOR)
@@ -1982,17 +2364,49 @@ def control_sphero():
                                 # Kurs zurück.
                                 sphero_heading = (kurs_referenz
                                                   + calc_kursversatz(gy)) % 360
+                                budget_erschoepft = False
                             else:
-                                # Ratensteuerung: Winkel je Durchlauf aufaddieren.
+                                # Ratensteuerung: Drehung aufaddieren, skaliert
+                                # mit der wirklich vergangenen Zeit.
                                 # Tempo mitgeben, damit die Kurve bei aktiver
                                 # Kopplung ihren Radius behält, statt bei
                                 # langsamer Fahrt enger zu werden.
-                                turn = calc_turn(gy, tempo=applied_speed)
-                                sphero_heading = (sphero_heading
-                                                  + (turn if state == "right" else -turn)) % 360
-                            guard.call(sphero.roll, int(sphero_heading), applied_speed,
-                                       ROLL_COMMAND_DURATION)
-                            set_led(*((255, 100, 0) if state == "right" else (0, 200, 255)))
+                                turn = calc_turn(gy, tempo=applied_speed, dt=dt)
+                                if state == "left":
+                                    turn = -turn
+
+                                # Dreh-Budget: Der Stand der laufenden
+                                # Handdrehung wird auf +/- LENK_MAX_DREHUNG
+                                # geklemmt, und nur die tatsächlich erlaubte
+                                # Differenz geht in den Kurs.
+                                #
+                                # Beidseitig geklemmt und nicht über den Betrag:
+                                # Ist das Budget nach rechts aufgebraucht, muss
+                                # eine Drehung nach LINKS trotzdem sofort
+                                # wirken. Über den Betrag gerechnet wäre sie
+                                # ebenfalls blockiert – die Testperson säße
+                                # fest, obwohl sie gerade zurücklenken will.
+                                if LENK_MAX_DREHUNG > 0:
+                                    neu = max(-LENK_MAX_DREHUNG,
+                                              min(LENK_MAX_DREHUNG, dreh_budget + turn))
+                                    turn        = neu - dreh_budget
+                                    dreh_budget = neu
+                                    budget_erschoepft = (
+                                        abs(dreh_budget) >= LENK_MAX_DREHUNG - 1e-6)
+                                else:
+                                    budget_erschoepft = False
+
+                                sphero_heading = (sphero_heading + turn) % 360
+
+                            drive.fahre(sphero_heading, applied_speed)
+                            # Aufgebrauchtes Budget wird durch eine dunklere
+                            # Kurvenfarbe angezeigt: Die Testperson sieht ohne
+                            # Erklärung, dass weiteres Halten der Hand nichts
+                            # mehr bewirkt und sie zurückdrehen muss.
+                            if budget_erschoepft:
+                                set_led(*((90, 35, 0) if state == "right" else (0, 70, 90)))
+                            else:
+                                set_led(*((255, 100, 0) if state == "right" else (0, 200, 255)))
                             last_move_time = time.time()
                             is_stopped     = False
                             with data_lock:
@@ -2006,8 +2420,12 @@ def control_sphero():
                             # und der Sphero ließe sich nicht zurückholen.
                             kurs_referenz = sphero_heading
                             applied_speed = calc_speed(gx)
-                            guard.call(sphero.roll, int(sphero_heading), applied_speed,
-                                       ROLL_COMMAND_DURATION)
+                            # Hand aus der Drehstellung zurück = neue Drehung,
+                            # also volles Budget. Damit ist eine Wende in
+                            # mehreren Zügen jederzeit möglich.
+                            dreh_budget       = 0.0
+                            budget_erschoepft = False
+                            drive.fahre(sphero_heading, applied_speed)
                             set_led(0, 255, 0)
                             last_move_time = time.time()
                             is_stopped     = False
@@ -2016,13 +2434,51 @@ def control_sphero():
                             # Auch das Anhalten rastet den Kurs ein, damit die
                             # nächste Drehung von der tatsächlichen Blickrichtung
                             # aus beginnt und nicht von einem alten Bezug.
-                            kurs_referenz = sphero_heading
+                            kurs_referenz     = sphero_heading
+                            dreh_budget       = 0.0
+                            budget_erschoepft = False
+
+                            # Tempo SOFORT auf 0, nicht erst nach STOP_TIME.
+                            # Das ist wichtiger, als es aussieht: Bisher hat
+                            # sphero.roll() am Ende jedes Aufrufs von sich aus
+                            # einen Stopp geschickt, der Ball stand also schon,
+                            # bevor STOP_TIME überhaupt zu laufen begann. Ohne
+                            # diese Zeile würde er nach dem Wegfall des
+                            # Auto-Stopps bis zu STOP_TIME (0,6 s) einfach
+                            # weiterfahren – und genau dieser Zweig fängt auch
+                            # den Fall ab, dass die Uhr keine Daten mehr liefert
+                            # (data_is_stale). Anhalten muss dann sofort
+                            # geschehen, nicht in einer halben Sekunde.
+                            # Wiederholungen kostet das nichts: Derselbe Befehl
+                            # wird von drive.fahre() übersprungen.
+                            drive.fahre(sphero_heading, 0)
+
                             if not is_stopped and time.time() - last_move_time > STOP_TIME:
-                                guard.call(sphero.stop_roll, int(sphero_heading))
+                                # Endgültiger Halt: erst jetzt gilt die Fahrt
+                                # als beendet (rote Anzeige). STOP_TIME ist
+                                # damit weiterhin das Halteband gegen Zittern
+                                # um die Fahrschwelle, ohne die Bremswirkung
+                                # zu verzögern.
+                                drive.halte(sphero_heading)
                                 is_stopped = True
                                 set_led(255, 0, 0)
 
                         consecutive_failures = 0
+                        consecutive_overload = 0
+
+                    except _BefehlUeberlastet as e:
+                        # Nur dieser Durchlauf ist ausgefallen. Der Ball fährt
+                        # mit dem letzten Befehl weiter, der nächste Versuch
+                        # kommt in einem Takt – kein Grund, eine funktionierende
+                        # Verbindung abzubauen (siehe _BefehlUeberlastet).
+                        consecutive_overload += 1
+                        if consecutive_overload >= MAX_CONSECUTIVE_OVERLOAD:
+                            recorder.log_event(
+                                "sphero_ueberlast",
+                                f"{consecutive_overload} zu langsame Befehle in Folge")
+                            connection_lost = True
+                            break
+                        print(f"[WARN] Sphero-Befehl zu langsam ({consecutive_overload}/{MAX_CONSECUTIVE_OVERLOAD}): {e}")
 
                     except Exception as e:
                         if _is_connection_error(e):
@@ -2036,7 +2492,25 @@ def control_sphero():
                             print(f"[WARN] Sphero-Befehl fehlgeschlagen: {e}")
 
                     recorder.log_control(gx, gy, gz, state, sphero_heading, applied_speed, is_stopped)
-                    time.sleep(CONTROL_LOOP_SLEEP)
+
+                    # ── Takt messen und einhalten ─────────────────────────────
+                    # Die erreichte Frequenz war bisher unbekannt und schwankte
+                    # zwischen 2,5 und 7 Hz, obwohl 10 Hz eingestellt waren.
+                    # Genau daran hing die Drehgeschwindigkeit. Jetzt wird sie
+                    # gemessen, angezeigt und protokolliert – so ist belegbar,
+                    # unter welchen Bedingungen eine Sitzung gefahren wurde.
+                    dauer = time.time() - schritt_start
+                    takt_mittel = dauer if takt_mittel <= 0 else takt_mittel + 0.2 * (dauer - takt_mittel)
+                    with data_lock:
+                        latest_data["loop_hz"] = (1.0 / takt_mittel) if takt_mittel > 1e-6 else 0.0
+                    if time.time() - takt_letzte_meldung >= 10.0:
+                        takt_letzte_meldung = time.time()
+                        recorder.log_event(
+                            "steuertakt",
+                            f"{1.0/takt_mittel:.1f} Hz; {takt_mittel*1000:.0f} ms je Durchlauf; "
+                            f"gesendet={drive.pakete}; uebersprungen={drive.uebersprungen}")
+
+                    _takt_warten(schritt_start)
 
                 # Sauber beenden wenn gewollt gestoppt
                 if connection_lost:
@@ -4001,14 +4475,16 @@ class DrivingTuneWindow:
 
       1. Grund-/Höchsttempo       – Tempobereich der Geradeausfahrt
       2. Schwelle (je Seite)      – ab wann die Kurve überhaupt beginnt
-      3. Max. Winkel (je Seite)   – wie viel Grad pro Schleifendurchlauf
+      3. Max. Winkel (je Seite)   – wie viel Grad je Bezugstakt
       4. Kurven-Tempo             – wie schnell er in der Kurve fährt
-      5. Zykluszeit               – wie oft pro Sekunde gelenkt wird
+      5. Bezugstakt der Lenkung   – auf welche Zeitspanne sich Punkt 3 bezieht
+      6. Zykluszeit               – wie oft die Steuerung nachregelt
 
-    Punkt 5 ist der am wenigsten offensichtliche: Der Winkel aus Punkt 3 wird
-    PRO DURCHLAUF aufaddiert. Die tatsächliche Drehgeschwindigkeit ist deshalb
-    Winkel geteilt durch Zykluszeit. Wer nur am Winkel dreht, ändert damit
-    immer auch die Drehgeschwindigkeit.
+    Punkte 3 und 5 gehören zusammen: Die Drehgeschwindigkeit ist Winkel geteilt
+    durch Bezugstakt. Punkt 6 wirkt NICHT mehr darauf – das war bis zur
+    Umstellung auf die zeitbasierte Drehrate anders und der Grund, weshalb
+    dieselbe Handhaltung je nach Rechenlast und Funkqualität unterschiedlich
+    schnell gedreht hat.
 
     Nachvollziehbarkeit: Jede Änderung wird in events.csv festgehalten (siehe
     _log_changes). Ohne das wäre in der Auswertung nicht mehr zu erkennen,
@@ -4082,6 +4558,8 @@ class DrivingTuneWindow:
         self.var_pos_r      = tk.DoubleVar(value=float(POS_MAX_OFFSET_RIGHT))
         self.var_expo       = tk.DoubleVar(value=float(LENK_EXPO))
         self.var_kopplung   = tk.DoubleVar(value=float(LENK_TEMPO_KOPPLUNG))
+        self.var_bezugstakt = tk.DoubleVar(value=float(LENK_BEZUGSTAKT_S))
+        self.var_maxdrehung = tk.DoubleVar(value=float(LENK_MAX_DREHUNG))
 
         # ── Fahrprofile ───────────────────────────────────────────────────────
         self._abschnitt(main, "Fahrprofil")
@@ -4163,8 +4641,11 @@ class DrivingTuneWindow:
                      "tiefer = er dreht insgesamt gemaechlicher; Kurven lassen sich "
                      "deutlich genauer treffen",
                      was="Hoechste Drehgeschwindigkeit, erreicht bei voller Handdrehung. "
-                         "Angabe in Grad je Lenkschritt; bei 100 ms Takt entsprechen "
-                         "30 Grad rund 300 Grad je Sekunde.")
+                         "Angabe in Grad je Bezugstakt (siehe Regler weiter unten): "
+                         "60 Grad je 0.22 s sind rund 270 Grad je Sekunde. Die Drehung "
+                         "wird mit der tatsaechlich vergangenen Zeit gerechnet und "
+                         "haengt deshalb NICHT mehr daran, wie schnell der Laptop und "
+                         "die Funkverbindung gerade sind.")
 
         self._abschnitt(main, "3  Rechtskurve")
         self._regler(main, "Schwelle rechts", self.var_schwelle_r, 0.40, 0.95, 0.01,
@@ -4181,7 +4662,7 @@ class DrivingTuneWindow:
                      "tiefer = er dreht insgesamt gemaechlicher; Kurven lassen sich "
                      "deutlich genauer treffen",
                      was="Hoechste Drehgeschwindigkeit nach rechts, erreicht bei voller "
-                         "Handdrehung. Gleiche Einheit wie links.")
+                         "Handdrehung. Gleiche Einheit wie links: Grad je Bezugstakt.")
 
         self._abschnitt(main, "3b  Nur bei Positionssteuerung")
         ttk.Label(main,
@@ -4228,6 +4709,33 @@ class DrivingTuneWindow:
                      was="Wie stark die Drehgeschwindigkeit dem Fahrtempo folgt. Bei 1.00 "
                          "drehen sich Tempo und Kurve immer im gleichen Verhaeltnis, "
                          "der Kurvenradius bleibt also konstant.")
+        self._regler(main, "Hoechste Drehung je Handdrehung", self.var_maxdrehung,
+                     0, 360, 10,
+                     "hoeher = er dreht sich bei gehaltener Hand weiter herum, bevor er "
+                     "auf Kurs bleibt; 360 = mehr als eine volle Umdrehung",
+                     "tiefer = eine einzelne Handdrehung schwenkt ihn nur ein Stueck "
+                     "weit; zum Weiterdrehen muss die Hand kurz zurueck in die Mitte "
+                     "(0 = aus, Voreinstellung)",
+                     was="Begrenzt, wie weit EINE durchgehende Handdrehung den Kurs "
+                         "aendern darf. VORSICHT beim Einschalten: Ist das Budget "
+                         "aufgebraucht, faehrt der Ball geradeaus weiter, obwohl die "
+                         "Hand noch gedreht ist – eine Dauerkurve um ein Objekt bricht "
+                         "dann mitten drin ab und die Steuerung fuehlt sich an wie eine "
+                         "Positionssteuerung. Deshalb steht der Regler auf 0. Sinnvoll "
+                         "nur, wenn eine Testperson zum Ueberdrehen neigt. Ist das "
+                         "Budget aufgebraucht, wird die Kurvenfarbe dunkler. Hand kurz "
+                         "in die Mitte = wieder volles Budget. Nur bei Ratensteuerung.")
+        self._regler(main, "Bezugstakt der Lenkung (s)", self.var_bezugstakt,
+                     0.05, 0.40, 0.01,
+                     "hoeher = dieselbe Handhaltung dreht langsamer (der Winkel oben "
+                     "verteilt sich auf mehr Zeit)",
+                     "tiefer = dieselbe Handhaltung dreht schneller",
+                     was="Zeitspanne, auf die sich 'Max. Winkel' bezieht. Die Drehung wird "
+                         "mit der wirklich vergangenen Zeit gerechnet, ist also unabhaengig "
+                         "davon, wie schnell der Laptop und die Funkverbindung gerade sind. "
+                         "0.22 s entspricht dem Verhalten der frueheren Fassung. "
+                         "Zusammen mit 'Max. Winkel' ergibt sich die Drehrate: "
+                         "60 Grad je 0.22 s sind rund 270 Grad je Sekunde.")
 
         self._abschnitt(main, "4  Gilt fuer beide Seiten")
         self._regler(main, "Kurven-Tempo", self.var_tempo, 0.20, 1.00, 0.05,
@@ -4239,13 +4747,15 @@ class DrivingTuneWindow:
                          "faehrt. 0.70 heisst: in der Kurve 70 Prozent des Tempos, das "
                          "die Handneigung sonst ergaebe.")
         self._regler(main, "Zykluszeit (s)", self.var_zyklus, 0.04, 0.15, 0.01,
-                     "hoeher = seltener gelenkt: er dreht langsamer und reagiert "
-                     "traeger, dafuer wird die Funkverbindung geschont",
-                     "tiefer = oefter gelenkt: er dreht schneller und reagiert direkter, "
+                     "hoeher = seltener nachgesteuert: er reagiert traeger, dafuer wird "
+                     "die Funkverbindung geschont",
+                     "tiefer = oefter nachgesteuert: er folgt der Hand direkter, "
                      "belastet aber die Funkverbindung (Abrissgefahr)",
-                     was="Abstand zwischen zwei Lenkbefehlen. Wirkt doppelt: Er bestimmt "
-                         "die Reaktionszeit UND – weil der Drehwinkel je Befehl gilt – "
-                         "die tatsaechliche Drehgeschwindigkeit.")
+                     was="Angestrebter Abstand zwischen zwei Durchlaeufen der Steuerung, "
+                         "also die Reaktionszeit auf eine Handbewegung. Die "
+                         "Drehgeschwindigkeit haengt NICHT mehr daran – dafuer sind "
+                         "'Max. Winkel' und 'Bezugstakt der Lenkung' zustaendig. "
+                         "Der tatsaechlich erreichte Takt steht unten in der Anzeige.")
 
         self._abschnitt(main, "5  Anhalten und Rueckwaerts")
         self._regler(main, "Nachlauf bis Stopp (s)", self.var_stoppzeit, 0.2, 2.0, 0.1,
@@ -4426,6 +4936,7 @@ class DrivingTuneWindow:
         global GLAETTUNG_TAU_S, GY_HYSTERESE, GX_HYSTERESE
         global STEUERMODUS, POS_MAX_OFFSET_LEFT, POS_MAX_OFFSET_RIGHT
         global LENK_EXPO, LENK_TEMPO_KOPPLUNG
+        global LENK_BEZUGSTAKT_S, LENK_MAX_DREHUNG
         global fahrprofil_name
 
         MIN_SPEED_DYN = int(round(float(self.var_tempo_min.get())))
@@ -4457,6 +4968,8 @@ class DrivingTuneWindow:
         POS_MAX_OFFSET_RIGHT  = int(round(float(self.var_pos_r.get())))
         LENK_EXPO             = round(float(self.var_expo.get()), 2)
         LENK_TEMPO_KOPPLUNG   = round(float(self.var_kopplung.get()), 2)
+        LENK_BEZUGSTAKT_S     = round(float(self.var_bezugstakt.get()), 3)
+        LENK_MAX_DREHUNG      = int(round(float(self.var_maxdrehung.get())))
         if self.var_modus.get() in STEUERMODI:
             STEUERMODUS = self.var_modus.get()
 
@@ -4489,6 +5002,10 @@ class DrivingTuneWindow:
         self.var_pos_r.set(werte["POS_MAX_OFFSET_RIGHT"])
         self.var_expo.set(werte["LENK_EXPO"])
         self.var_kopplung.set(werte["LENK_TEMPO_KOPPLUNG"])
+        # .get() mit Vorgabe: Ein selbst ergänztes Profil ohne die neueren
+        # Schlüssel soll die Regler nicht mit einem KeyError abbrechen lassen.
+        self.var_bezugstakt.set(werte.get("LENK_BEZUGSTAKT_S", LENK_BEZUGSTAKT_S))
+        self.var_maxdrehung.set(werte.get("LENK_MAX_DREHUNG", LENK_MAX_DREHUNG))
         self.var_modus.set(werte["STEUERMODUS"])
         self._uebernehmen(profil=name)
         set_status(f"Fahrprofil „{name}“ übernommen.")
@@ -4554,6 +5071,8 @@ class DrivingTuneWindow:
             self.var_pos_r.set(POS_MAX_OFFSET_RIGHT)
             self.var_expo.set(LENK_EXPO)
             self.var_kopplung.set(LENK_TEMPO_KOPPLUNG)
+            self.var_bezugstakt.set(LENK_BEZUGSTAKT_S)
+            self.var_maxdrehung.set(LENK_MAX_DREHUNG)
             self.var_modus.set(STEUERMODUS)
             self.profil_var.set(
                 "aktuell: von Hand eingestellt" if fahrprofil_name == PROFIL_MANUELL
@@ -4595,7 +5114,9 @@ class DrivingTuneWindow:
                 f"POS_MAX_OFFSET_LEFT   = {POS_MAX_OFFSET_LEFT}\n"
                 f"POS_MAX_OFFSET_RIGHT  = {POS_MAX_OFFSET_RIGHT}\n"
                 f"LENK_EXPO             = {LENK_EXPO}\n"
-                f"LENK_TEMPO_KOPPLUNG   = {LENK_TEMPO_KOPPLUNG}")
+                f"LENK_TEMPO_KOPPLUNG   = {LENK_TEMPO_KOPPLUNG}\n"
+                f"LENK_BEZUGSTAKT_S     = {LENK_BEZUGSTAKT_S}\n"
+                f"LENK_MAX_DREHUNG      = {LENK_MAX_DREHUNG}")
 
     def _print_werte(self):
         print("[FAHRVERHALTEN] " + self._werte_text().replace("\n", "   "))
@@ -4614,16 +5135,21 @@ class DrivingTuneWindow:
 
     def _zeichne(self):
         with data_lock:
-            gy    = latest_data["gy"]
-            gx    = latest_data["gx"]
-            state = latest_data["state"]
+            gy      = latest_data["gy"]
+            gx      = latest_data["gx"]
+            state   = latest_data["state"]
+            loop_hz = latest_data.get("loop_hz", 0.0)
 
         if gy > 0:
             self._max_links = max(self._max_links, gy)
         else:
             self._max_rechts = min(self._max_rechts, gy)
 
-        zyklus   = ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP
+        # Bezugsgröße der Drehrate ist seit der Umstellung auf zeitbasiertes
+        # Lenken der Bezugstakt, NICHT mehr die Zykluszeit der Schleife. Beides
+        # zu verwechseln war genau der Fehler, der die Kurven unberechenbar
+        # gemacht hat, deshalb steht hier bewusst der Bezugstakt.
+        zyklus   = LENK_BEZUGSTAKT_S if LENK_BEZUGSTAKT_S > 1e-6 else 0.22
         richtung = {"left": "LINKS", "right": "RECHTS"}.get(state, "geradeaus")
         tempo    = int(calc_speed(gx) * TURN_SPEED_FACTOR) if state in ("left", "right") \
             else calc_speed(gx)
@@ -4642,9 +5168,30 @@ class DrivingTuneWindow:
             # und nicht eine Drehrate zeigt, die so gar nicht gefahren wird.
             winkel = calc_turn(gy, tempo=tempo) if dreht else 0.0
             kopf = (f"gY jetzt : {gy:+.2f}  ->  {richtung:9s} {winkel:5.1f} "
-                    f"Grad je Schritt = {winkel / zyklus:6.0f} Grad/s")
+                    f"Grad je Bezugstakt = {winkel / zyklus:6.0f} Grad/s")
             if LENK_TEMPO_KOPPLUNG > 0:
                 kopf += f"  (Tempo-Kopplung {LENK_TEMPO_KOPPLUNG:.2f})"
+
+        # Der gemessene Takt gehört sichtbar in die Oberfläche: Er ist die
+        # Kenngröße dafür, ob die Steuerung gerade unter guten Bedingungen
+        # läuft. Fällt er weit unter den eingestellten Wert, wird der Laptop zu
+        # warm oder die Funkverbindung ist gestört – die Drehrate selbst bleibt
+        # davon jetzt unberührt, das Ansprechverhalten aber nicht.
+        ziel_hz = 1.0 / max(ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP, 1e-6)
+        if loop_hz > 0:
+            takt_text = (f"Steuertakt gemessen {loop_hz:4.1f} Hz "
+                         f"({1000/loop_hz:3.0f} ms), eingestellt {ziel_hz:4.1f} Hz")
+            if loop_hz < 0.7 * ziel_hz:
+                takt_text += "   <-- deutlich zu langsam"
+        else:
+            takt_text = (f"Steuertakt: Sphero-Steuerung laeuft nicht "
+                         f"(eingestellt {ziel_hz:4.1f} Hz)")
+
+        if STEUERMODUS == STEUERMODUS_POSITION or LENK_MAX_DREHUNG <= 0:
+            budget_text = "Dreh-Budget: aus"
+        else:
+            budget_text = (f"Dreh-Budget: {LENK_MAX_DREHUNG} Grad je Handdrehung "
+                           f"(Hand in die Mitte = wieder voll)")
 
         self.live_var.set(
             kopf + "\n"
@@ -4653,8 +5200,8 @@ class DrivingTuneWindow:
             f"Vollgas ab gX {GX_FULL_SPEED:+.2f})\n"
             f"groesster Ausschlag   links {self._max_links:+.2f}   "
             f"rechts {self._max_rechts:+.2f}\n"
-            f"Zykluszeit {zyklus*1000:.0f} ms  =  {1/zyklus:.1f} Lenkschritte/s, "
-            f"{2/zyklus:.0f} Funkbefehle/s"
+            f"{takt_text}\n"
+            f"{budget_text}"
         )
 
         if STEUERMODUS == STEUERMODUS_POSITION:
@@ -4667,7 +5214,7 @@ class DrivingTuneWindow:
                 zeilen.append(f"      {n:.2f}    | {li:6.1f}   {re:6.1f}")
         else:
             zeilen = ["  Handdrehung |     links     |    rechts",
-                      "              | Grad    Grad/s| Grad    Grad/s",
+                      "              | /Takt   Grad/s| /Takt   Grad/s",
                       "  ------------+---------------+---------------"]
             for n in self.VERGLEICHS_NEIGUNGEN:
                 li = calc_turn(+n, tempo=tempo) if +n > abs(GY_LEFT_THRESHOLD)  else 0.0
@@ -5088,12 +5635,28 @@ def show_controller_ui():
             gz          = latest_data["gz"]
             state       = latest_data["state"]
             heading     = latest_data["heading"]
+            loop_hz     = latest_data.get("loop_hz", 0.0)
             status_text = last_status
+
+        # Steuertakt gehört ins Hauptfenster, nicht nur ins Einstellfenster:
+        # Er ist die Kenngröße dafür, ob die Steuerung gerade unter guten
+        # Bedingungen läuft, und muss während einer Testfahrt ohne Scrollen und
+        # ohne zusätzliches Fenster ablesbar sein. Fällt er deutlich unter den
+        # eingestellten Wert, wird der Laptop zu warm oder die Funkverbindung
+        # ist gestört – die Drehrate bleibt davon zwar unberührt (siehe
+        # LENK_BEZUGSTAKT_S), das Ansprechen auf die Hand aber nicht.
+        ziel_hz = 1.0 / max(ROLL_COMMAND_DURATION + CONTROL_LOOP_SLEEP, 1e-6)
+        if loop_hz <= 0:
+            takt_text = "Takt –"
+        elif loop_hz < 0.7 * ziel_hz:
+            takt_text = f"Takt {loop_hz:.1f} Hz von {ziel_hz:.0f}  ZU LANGSAM"
+        else:
+            takt_text = f"Takt {loop_hz:.1f} Hz"
 
         # Angezeigt werden die bereits auf den Tragearm normierten Werte –
         # dieselben, mit denen die Steuerung rechnet.
         sensor_var.set(f"gX={gx:+.2f}  gY={gy:+.2f}  gZ={gz:+.2f}   "
-                       f"(Uhr {watch_arm})")
+                       f"(Uhr {watch_arm})   |   {takt_text}")
         status_var.set(status_text)
         heading_var.set(f"Heading: {int(heading)}°")
 
