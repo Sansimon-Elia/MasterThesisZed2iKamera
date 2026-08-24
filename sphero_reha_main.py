@@ -1170,7 +1170,21 @@ _CSV_SCHEMAS = {
     # Rückwärtsstrecke sind unterschiedlich lang, ein Zeitverhältnis wäre also
     # von der Streckenwahl abhängig. ratio_rw_vw = Tempo rückwärts / Tempo
     # vorwärts ist dagegen streckenunabhängig (Werte < 1 = langsamer rückwärts).
-    "aufgaben":     ["versuch", "abstand_m", "rw_strecke_m",
+    #
+    # teilnehmer_id steht in JEDER Zeile: Die Sitzungsordner sind zwar nach
+    # Person sortiert, eine herausgeloeste CSV-Zeile waere ohne die Kennung
+    # aber nicht mehr zuzuordnen.
+    #
+    # ZWEI Zaehlungen, weil eine Person ihre Durchgaenge ueber mehrere
+    # Aufzeichnungen verteilt (Pause zwischen den Durchgaengen, die
+    # Aufzeichnung wird dazwischen beendet):
+    #   versuch            - fortlaufend ueber ALLE Sitzungen dieser Person.
+    #                        Das ist die Nummer aus dem Studienprotokoll:
+    #                        Durchgang 1 = UEbungsdurchgang, 2..n = Wertung.
+    #   versuch_in_session - Position innerhalb dieses Sitzungsordners.
+    #                        Nur zur Nachvollziehbarkeit, nie zur Auswertung.
+    "aufgaben":     ["teilnehmer_id", "versuch", "versuch_in_session",
+                      "abstand_m", "rw_strecke_m",
                       "backward_dauer_s", "backward_speed",
                       "t_rel_start_s", "t_rel_ende_s", "dauer_s",
                       "t_hinweg_s", "t_rundkurs_s", "t_standard_s",
@@ -1181,6 +1195,201 @@ _CSV_SCHEMAS = {
                       "rueckwaerts_strecke",
                       "hr_mittel", "hr_max", "gueltig", "notiz"],
 }
+
+# Sammeltabelle je Testperson: sessions/<ID>/aufgaben_alle.csv
+#
+# Warum zusaetzlich zu den Sitzungs-CSVs: Die vier Durchgaenge einer Person
+# entstehen in der Regel in vier getrennten Aufzeichnungen, weil zwischen den
+# Durchgaengen Pause gemacht wird und die Aufzeichnung dabei beendet ist. Fuer
+# die Auswertung ("Durchgang 1 verwerfen, 2 bis 4 mitteln") muessen sie aber in
+# EINER Tabelle stehen. Die Datei ist reine Ableitung - sie enthaelt keine
+# Angabe, die nicht auch in den Sitzungsordnern steht, und laesst sich daraus
+# jederzeit neu erzeugen (siehe sammel_csv_aufbauen).
+AUFGABEN_SAMMEL_DATEI = "aufgaben_alle.csv"
+_AUFGABEN_SAMMEL_SCHEMA = (["teilnehmer_id", "session_id"]
+                           + [spalte for spalte in _CSV_SCHEMAS["aufgaben"]
+                              if spalte != "teilnehmer_id"])
+
+
+def teilnehmer_ordner(participant_id: str) -> str:
+    """Ordner, in dem alle Sitzungen einer Testperson liegen."""
+    return os.path.join(SESSIONS_DIR, participant_id)
+
+
+def sammel_csv_pfad(participant_id: str) -> str:
+    return os.path.join(teilnehmer_ordner(participant_id), AUFGABEN_SAMMEL_DATEI)
+
+
+def _sitzungsordner(participant_id: str):
+    """
+    Sitzungsordner einer Person in zeitlicher Reihenfolge.
+
+    Der Ordnername endet auf den Zeitstempel des Aufnahmestarts; alphabetisch
+    sortiert ist damit zugleich chronologisch sortiert.
+    """
+    basis = teilnehmer_ordner(participant_id)
+    if not os.path.isdir(basis):
+        return []
+    return sorted(
+        os.path.join(basis, name) for name in os.listdir(basis)
+        if os.path.isdir(os.path.join(basis, name))
+        and os.path.isfile(os.path.join(basis, name, "aufgaben.csv")))
+
+
+def sammel_csv_aufbauen(participant_id: str) -> str:
+    """
+    Die Sammeltabelle einer Person aus ihren Sitzungsordnern neu erzeugen.
+
+    Zwei Faelle, die unterschiedlich behandelt werden muessen:
+
+    Neue Sitzungen fuehren die Spalte teilnehmer_id und darin bereits die
+    personenweite Durchgangsnummer - die wird unveraendert uebernommen.
+
+    Aeltere Sitzungen (vor dieser Aenderung) haben die Spalte nicht. Dort war
+    "versuch" ein Zaehler des Aufgabenfensters, der bei jedem Neuoeffnen wieder
+    bei 1 begann; dieselbe Person hat dadurch mehrere Zeilen "Durchgang 1".
+    Fuer solche Zeilen wird die Nummer aus der zeitlichen Reihenfolge der
+    Sitzungsordner neu vergeben - das ist die einzige Information, die den
+    tatsaechlichen Ablauf noch wiedergibt. Die Sitzungs-CSVs bleiben dabei
+    unangetastet, der urspruengliche Zaehlerstand ist also nicht verloren.
+    """
+    ordner = teilnehmer_ordner(participant_id)
+    if not os.path.isdir(ordner):
+        return ""
+
+    zeilen = []
+    laufend = 0
+    for sitzung in _sitzungsordner(participant_id):
+        session_id = os.path.basename(sitzung)
+        try:
+            with open(os.path.join(sitzung, "aufgaben.csv"),
+                      newline="", encoding="utf-8") as f:
+                daten = list(csv.DictReader(f))
+        except OSError:
+            continue
+        for i, satz in enumerate(daten, start=1):
+            laufend += 1
+            # Neues Format erkennt man an teilnehmer_id; nur dann ist die
+            # gespeicherte Nummer schon personenweit vergeben.
+            gespeichert = (satz.get("versuch") or "").strip()
+            if satz.get("teilnehmer_id") and gespeichert.isdigit():
+                nummer  = int(gespeichert)
+                laufend = max(laufend, nummer)
+            else:
+                nummer = laufend
+            satz["teilnehmer_id"]      = participant_id
+            satz["session_id"]         = session_id
+            satz["versuch"]            = nummer
+            satz["versuch_in_session"] = satz.get("versuch_in_session") or i
+            zeilen.append(satz)
+
+    pfad = sammel_csv_pfad(participant_id)
+    with open(pfad, "w", newline="", encoding="utf-8") as f:
+        schreiber = csv.writer(f)
+        schreiber.writerow(_AUFGABEN_SAMMEL_SCHEMA)
+        for satz in zeilen:
+            schreiber.writerow([satz.get(spalte, "")
+                                for spalte in _AUFGABEN_SAMMEL_SCHEMA])
+    return pfad
+
+
+def sammel_csv_sicherstellen(participant_id: str) -> str:
+    """
+    Pfad der Sammeltabelle liefern und sie anlegen, falls sie noch fehlt.
+
+    Damit werden auch Personen erfasst, deren Durchgaenge vor dieser Aenderung
+    aufgezeichnet wurden: Beim ersten Zugriff wird die Tabelle einmalig aus
+    den vorhandenen Sitzungsordnern nachgebaut.
+    """
+    if not participant_id:
+        return ""
+    pfad = sammel_csv_pfad(participant_id)
+    if os.path.isfile(pfad):
+        return pfad
+    if not os.path.isdir(teilnehmer_ordner(participant_id)):
+        return pfad
+    return sammel_csv_aufbauen(participant_id) or pfad
+
+
+def durchgaenge_der_person(participant_id: str):
+    """
+    Alle bisher gespeicherten Durchgaenge einer Person, nach Nummer sortiert.
+
+    Grundlage fuer die Weiterzaehlung und fuer die Ergebnistabelle im
+    Aufgabenfenster - beide muessen ueber Sitzungsgrenzen hinweg dasselbe Bild
+    zeigen wie die spaetere Auswertung.
+    """
+    if not participant_id:
+        return []
+    pfad = sammel_csv_sicherstellen(participant_id)
+    if not pfad or not os.path.isfile(pfad):
+        return []
+    try:
+        with open(pfad, newline="", encoding="utf-8") as f:
+            zeilen = list(csv.DictReader(f))
+    except OSError:
+        return []
+
+    def nummer(satz):
+        wert = (satz.get("versuch") or "").strip()
+        return int(wert) if wert.isdigit() else 0
+
+    return sorted(zeilen, key=nummer)
+
+
+def naechste_versuchsnummer(participant_id: str) -> int:
+    """
+    Nummer, die der naechste Durchgang dieser Person bekommt.
+
+    Gezaehlt wird ueber alle Sitzungen hinweg, damit die Nummerierung dem
+    Studienprotokoll entspricht (Durchgang 1 = UEbung, 2..n = Wertung) und
+    nicht davon abhaengt, wie oft die Aufzeichnung zwischendurch beendet
+    wurde. Verworfene Durchgaenge verbrauchen ihre Nummer mit: Sie bleiben als
+    gueltig=0 in den Daten stehen, und eine spaeter neu vergebene Nummer wuerde
+    zwei verschiedene Fahrten gleich benennen.
+    """
+    hoechste = 0
+    for satz in durchgaenge_der_person(participant_id):
+        wert = (satz.get("versuch") or "").strip()
+        if wert.isdigit():
+            hoechste = max(hoechste, int(wert))
+    return hoechste + 1
+
+
+STUDIE_SAMMEL_DATEI = "aufgaben_alle_personen.csv"
+
+
+def studien_csv_aufbauen() -> str:
+    """
+    Alle Durchgaenge aller Testpersonen in EINE Tabelle schreiben.
+
+    sessions/aufgaben_alle_personen.csv ist die Datei, die in der Auswertung
+    tatsaechlich geoeffnet wird: eine Zeile je gefahrenem Durchgang, mit
+    teilnehmer_id und personenweiter Durchgangsnummer, also unmittelbar
+    gruppierbar. Sie wird bei jedem Ende einer Aufzeichnung vollstaendig neu
+    erzeugt statt fortgeschrieben - so kann sie nicht auseinanderlaufen, und
+    von Hand geloeschte oder nachtraeglich korrigierte Sitzungen schlagen
+    sofort durch.
+    """
+    if not os.path.isdir(SESSIONS_DIR):
+        return ""
+    personen = sorted(
+        name for name in os.listdir(SESSIONS_DIR)
+        if os.path.isdir(os.path.join(SESSIONS_DIR, name)))
+
+    pfad = os.path.join(SESSIONS_DIR, STUDIE_SAMMEL_DATEI)
+    try:
+        with open(pfad, "w", newline="", encoding="utf-8") as f:
+            schreiber = csv.writer(f)
+            schreiber.writerow(_AUFGABEN_SAMMEL_SCHEMA)
+            for pid in personen:
+                for satz in durchgaenge_der_person(pid):
+                    schreiber.writerow([satz.get(spalte, "")
+                                        for spalte in _AUFGABEN_SAMMEL_SCHEMA])
+    except OSError as e:
+        print(f"[WARN] Studientabelle {pfad} nicht schreibbar: {e}")
+        return ""
+    return pfad
 
 
 class SessionRecorder:
@@ -1250,8 +1459,14 @@ class SessionRecorder:
 
             # Sitzungen liegen unter sessions/<Teilnehmer-ID>/, damit in der
             # Auswertung alle Aufnahmen einer Person beisammen liegen.
-            participant_dir = os.path.join(SESSIONS_DIR, self.participant_id)
+            participant_dir = teilnehmer_ordner(self.participant_id)
             os.makedirs(participant_dir, exist_ok=True)
+            # Sammeltabelle der Person JETZT bereitstellen, nicht erst beim
+            # ersten Durchgang: Fehlt sie, wird sie aus den vorhandenen
+            # Sitzungsordnern nachgebaut - danach kann jeder Durchgang einfach
+            # angehaengt werden, ohne dass eine bereits erfasste Zeile ein
+            # zweites Mal hineingeraet.
+            sammel_csv_sicherstellen(self.participant_id)
             session_id = (f"{self.participant_id}_session_"
                           + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
             self.session_dir = os.path.join(participant_dir, session_id)
@@ -1326,6 +1541,10 @@ class SessionRecorder:
 
             finished_dir = self.session_dir
             self.session_dir = None
+            # Erst jetzt, nicht nach jedem Durchgang: Die Datei wird komplett
+            # neu geschrieben, und zum Ende der Aufzeichnung ist der Stand
+            # dieser Sitzung vollstaendig.
+            studien_csv_aufbauen()
             return finished_dir
 
     # ── Logging-Methoden (threadsicher) ──────────────────────────────────────
@@ -1437,16 +1656,59 @@ class SessionRecorder:
         Einen abgeschlossenen Aufgabendurchgang festhalten.
 
         Erwartet die Spalten aus _CSV_SCHEMAS["aufgaben"]; fehlende bleiben leer.
+        Die Kennung der Testperson und die Position innerhalb der Sitzung
+        ergaenzt der Recorder selbst - er kennt beides sicher, das
+        Aufgabenfenster muesste es sich zusammensuchen.
+
+        Geschrieben wird an ZWEI Stellen: in die CSV dieser Sitzung und in die
+        Sammeltabelle der Person. Beides sofort geflusht, damit ein Absturz
+        hoechstens den laufenden, nicht aber einen bereits beendeten Durchgang
+        kostet.
         """
         if not self.active:
             return
         with self._lock:
             if not self.active or "aufgaben" not in self._writers:
                 return
+
+            satz = dict(zeile)
+            satz["teilnehmer_id"]      = self.participant_id
+            satz["versuch_in_session"] = self._counts["aufgaben"] + 1
+
             self._writers["aufgaben"].writerow(
-                [zeile.get(spalte, "") for spalte in _CSV_SCHEMAS["aufgaben"]])
+                [satz.get(spalte, "") for spalte in _CSV_SCHEMAS["aufgaben"]])
             self._files["aufgaben"].flush()
             self._counts["aufgaben"] += 1
+
+            self._sammel_zeile_anhaengen(satz)
+
+    def _sammel_zeile_anhaengen(self, satz: dict):
+        """
+        Einen Durchgang an die Sammeltabelle der Person anhaengen.
+
+        Die Datei wird je Durchgang geoeffnet und wieder geschlossen statt
+        offen gehalten: Es sind wenige Zeilen je Sitzung, dafuer liegt der
+        Stand nach jedem Durchgang vollstaendig auf der Platte - auch wenn die
+        Aufzeichnung danach nicht sauber beendet wird.
+        """
+        if not self.participant_id:
+            return
+        satz = dict(satz)
+        satz["session_id"] = os.path.basename(self.session_dir or "")
+        pfad = sammel_csv_pfad(self.participant_id)
+        try:
+            neu_anlegen = not os.path.isfile(pfad)
+            with open(pfad, "a", newline="", encoding="utf-8") as f:
+                schreiber = csv.writer(f)
+                if neu_anlegen:
+                    schreiber.writerow(_AUFGABEN_SAMMEL_SCHEMA)
+                schreiber.writerow([satz.get(spalte, "")
+                                    for spalte in _AUFGABEN_SAMMEL_SCHEMA])
+        except OSError as e:
+            # Die Sitzungs-CSV ist zu diesem Zeitpunkt bereits geschrieben, der
+            # Durchgang also nicht verloren - die Sammeltabelle laesst sich
+            # daraus jederzeit mit sammel_csv_aufbauen() neu erzeugen.
+            print(f"[WARN] Sammeltabelle {pfad} nicht beschreibbar: {e}")
 
     def log_event(self, event: str, detail: str = ""):
         if not self.active:
@@ -3449,8 +3711,19 @@ class AufgabeFenster:
         self._teilnehmer_text = teilnehmer_text
         self._laeuft      = False
         self._job         = None
+        # Die Nummer des zuletzt gefahrenen Durchgangs. Die eigentliche
+        # Zaehlung liegt NICHT hier, sondern in den gespeicherten Daten der
+        # Testperson (naechste_versuchsnummer): Zwischen zwei Durchgaengen wird
+        # Pause gemacht und die Aufzeichnung beendet, ein Zaehler im Fenster
+        # wuerde dabei jedes Mal wieder bei 1 anfangen.
         self._versuch     = 0
         self._ergebnisse  = []
+        # Durchgaenge, die ohne laufende Aufzeichnung gefahren wurden. Sie
+        # stehen in keiner CSV und wuerden beim Neuaufbau der Tabelle aus den
+        # gespeicherten Daten verschwinden - fuer die betreuende Person sollen
+        # sie bis zum Schliessen des Fensters aber sichtbar bleiben.
+        self._ungespeichert = []
+        self._ungespeichert_pid = None
 
         # Abschnittssteuerung innerhalb eines laufenden Durchgangs.
         self._abschnitt_i     = 0
@@ -3562,11 +3835,16 @@ class AufgabeFenster:
         ttk.Label(main, text="Zeitnahme",
                   font=("Segoe UI", 11, "bold")).pack(anchor="w")
         ttk.Label(main,
-                  text="Empfohlener Ablauf: 3 Durchgänge direkt hintereinander, mit "
-                       "derselben vorgelesenen Anweisung. Durchgang 1 ist der "
-                       "Übungsdurchgang und wird bei der Auswertung ausgeschlossen "
-                       "(gespeichert wird er trotzdem); gewertet wird der Mittelwert "
-                       "der Durchgänge 2 und 3.",
+                  text="Vorgesehener Ablauf: 4 Durchgänge, mit derselben vorgelesenen "
+                       "Anweisung. Durchgang 1 ist der Übungsdurchgang und wird bei der "
+                       "Auswertung ausgeschlossen (gespeichert wird er trotzdem); "
+                       "gewertet wird der Mittelwert der Durchgänge 2 bis 4. Mehr als "
+                       "4 Durchgänge sind möglich – sie werden fortlaufend "
+                       "weitergezählt und alle mitgewertet.\n"
+                       "Die Zählung läuft über die gesamte Testperson, nicht über die "
+                       "einzelne Aufzeichnung: Zwischen den Durchgängen darf die "
+                       "Aufzeichnung für eine Pause beendet und später neu gestartet "
+                       "werden.",
                   foreground="#555", wraplength=560,
                   justify="left").pack(anchor="w", pady=(2, 4))
 
@@ -3618,7 +3896,7 @@ class AufgabeFenster:
 
         # ── Ergebnisse dieser Sitzung ─────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(12, 8))
-        ttk.Label(main, text="Durchgänge dieser Sitzung",
+        ttk.Label(main, text="Durchgänge dieser Testperson (alle Aufzeichnungen)",
                   font=("Segoe UI", 11, "bold")).pack(anchor="w")
         self.tabelle_var = tk.StringVar(value="noch keine")
         ttk.Label(main, textvariable=self.tabelle_var, font=("Consolas", 10),
@@ -3796,11 +4074,60 @@ class AufgabeFenster:
         else:
             self.eing_status_var.set(
                 f"abgeschlossen ({EINGEWOEHNUNG_S} s). "
-                f"Bereit für Durchgang {self._versuch + 1}.")
+                f"Bereit für Durchgang {self._naechste_nr()}.")
         recorder.log_event(
             "eingewoehnung_ende",
             f"{gefahren:.1f} s von {EINGEWOEHNUNG_S} s; "
             f"{'ABGEBROCHEN' if abgebrochen else 'vollstaendig'}")
+
+    # ── Durchgangsnummer und Verlauf ─────────────────────────────────────────
+
+    def _naechste_nr(self) -> int:
+        """
+        Nummer des naechsten Durchgangs dieser Testperson.
+
+        Massgeblich sind die bereits gespeicherten Durchgaenge, damit die
+        Zaehlung ueber Aufzeichnungsgrenzen hinweg durchlaeuft. Der lokale
+        Stand geht trotzdem mit ein: Wurde ohne Aufzeichnung gefahren, steht
+        der Durchgang in keiner Datei, soll die Anzeige aber trotzdem
+        weiterzaehlen statt dieselbe Nummer noch einmal anzubieten.
+        """
+        pid = recorder.participant_id
+        gespeichert = naechste_versuchsnummer(pid) if pid else 1
+        return max(gespeichert, self._versuch + 1)
+
+    def _verlauf_laden(self):
+        """
+        Ergebnisliste aus den gespeicherten Durchgaengen der Person aufbauen.
+
+        Die Tabelle zeigt damit alle Durchgaenge der Testperson, nicht nur die
+        der laufenden Aufzeichnung - genau die Zusammenstellung, die spaeter
+        auch ausgewertet wird (Durchgang 1 verwerfen, Rest mitteln).
+        """
+        pid = recorder.participant_id
+        # Wird zwischendurch eine andere Testperson aufgezeichnet, gehoeren die
+        # ungespeicherten Durchgaenge der vorigen Person nicht mehr hierher.
+        if pid != self._ungespeichert_pid:
+            self._ungespeichert = []
+            self._ungespeichert_pid = pid
+
+        eintraege = []
+        for satz in durchgaenge_der_person(pid):
+            nummer = (satz.get("versuch") or "").strip()
+            if not nummer.isdigit():
+                continue
+            try:
+                dauer = float(satz.get("dauer_s") or "nan")
+            except ValueError:
+                dauer = float("nan")
+            eintraege.append((
+                int(nummer), dauer,
+                (satz.get("t_standard_s") or "").strip(),
+                (satz.get("t_rueckwaerts_s") or "").strip(),
+                (satz.get("ratio_rw_vw") or "").strip(),
+                (satz.get("gueltig") or "").strip() == "1",
+            ))
+        self._ergebnisse = eintraege + self._ungespeichert
 
     # ── Durchgang ─────────────────────────────────────────────────────────────
 
@@ -3812,7 +4139,7 @@ class AufgabeFenster:
 
     def _starten(self):
         start_server_once()
-        self._versuch += 1
+        self._versuch  = self._naechste_nr()
         self._laeuft   = True
         self._t_start  = clock.t_abs()
         self._zwischen = []
@@ -4053,8 +4380,13 @@ class AufgabeFenster:
             f"Rueckwaerts {self._rueckwaerts} "
             f"(Korrektur {korrektur}, Strecke {tipps('rueckwaerts') or 0})")
 
-        self._ergebnisse.append((self._versuch, dauer, t_standard,
-                                 zeit("rueckwaerts"), ratio, gueltig))
+        # Bei laufender Aufzeichnung steht der Durchgang jetzt in der
+        # Sammeltabelle der Person und wird von dort gelesen; ihn zusaetzlich
+        # lokal zu merken, wuerde ihn in der Tabelle verdoppeln.
+        if not recorder.active:
+            self._ungespeichert_pid = recorder.participant_id
+            self._ungespeichert.append((self._versuch, dauer, t_standard,
+                                        zeit("rueckwaerts"), ratio, gueltig))
         self.zeit_var.set(f"{dauer:.1f} s")
         self.start_button.config(text="▶  Aufgabe starten")
         self.zwischen_button.config(state="disabled")
@@ -4064,7 +4396,8 @@ class AufgabeFenster:
         gespeichert = "gespeichert" if recorder.active else "NICHT gespeichert (keine Aufzeichnung)"
         self.status_var.set(
             f"Durchgang {self._versuch} {'beendet' if gueltig else 'verworfen'}: "
-            f"{dauer:.1f} s – {gespeichert}. Bereit für Durchgang {self._versuch + 1}.")
+            f"{dauer:.1f} s – {gespeichert}. "
+            f"Bereit für Durchgang {self._naechste_nr()}.")
         self._anzeige_auffrischen()
 
     # ── Anzeige ───────────────────────────────────────────────────────────────
@@ -4079,6 +4412,14 @@ class AufgabeFenster:
             f"Rückwärtsfahrt zurzeit: {BACKWARD_DURATION:.1f} s je Doppeltipp "
             f"bei Tempo {BACKWARD_SPEED}. Über die gesamte Studie unverändert "
             f"lassen – wird mit jedem Durchgang gespeichert.")
+
+        self._verlauf_laden()
+        # Solange in diesem Fenster noch kein Durchgang gefahren wurde, zeigt
+        # die Statuszeile die Nummer, die als naechstes vergeben wird. Bei
+        # einer Person mit bereits gefahrenen Durchgaengen ist das nicht die 1
+        # - und genau das muss die betreuende Person sehen, bevor sie startet.
+        if not self._laeuft and self._versuch == 0:
+            self.status_var.set(f"Bereit für Durchgang {self._naechste_nr()}.")
 
         if not self._ergebnisse:
             self.tabelle_var.set("noch keine")
@@ -5822,9 +6163,14 @@ def show_controller_ui():
         if recorder.active:
             session_dir = recorder.stop()
             if session_dir:
+                pid = recorder.participant_id
                 messagebox.showinfo(
                     "Aufzeichnung gespeichert",
-                    f"Sitzung wurde gespeichert unter:\n{session_dir}"
+                    f"Sitzung wurde gespeichert unter:\n{session_dir}\n\n"
+                    f"Alle Durchgänge dieser Testperson:\n"
+                    f"{sammel_csv_pfad(pid) if pid else '-'}\n\n"
+                    f"Alle Durchgänge aller Testpersonen:\n"
+                    f"{os.path.join(SESSIONS_DIR, STUDIE_SAMMEL_DATEI)}"
                 )
             return
 
