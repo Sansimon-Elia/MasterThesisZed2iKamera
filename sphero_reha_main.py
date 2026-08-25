@@ -556,21 +556,60 @@ DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine
 # Einstellung: Sie steht in metadata.json ("config"), jede Änderung während der
 # Fahrt zusätzlich in events.csv.
 FAHRPROFILE = {
+    # ── Ausgangslage aller drei Profile ──────────────────────────────────────
+    #
+    # Sanft und Sportlich stehen zurzeit auf DENSELBEN Werten wie Standard.
+    # Das ist kein Versehen, sondern der Ausgangspunkt fuer ihre Justierung:
+    # Der Standard-Stand ist mit P05-P07 eingefahren und faehrt nachweislich
+    # fluessig. Von dort aus wird jeweils in EINE Richtung verstellt, statt
+    # von alten, nie ueberprueften Werten auszugehen.
+    #
+    # Solange die drei gleich sind, macht ein Profilwechsel nichts sichtbares.
+    # Das ist der gewollte Zwischenstand: Wer justiert, sieht dann sicher, dass
+    # jede Aenderung von ihm kommt und nicht von einem Altbestand.
+    #
+    # ACHTUNG bei BACKWARD_SPEED: Der Wert steht in JEDER Ergebniszeile und
+    # bestimmt, wie weit ein Doppeltipp traegt. Wird er zwischen den Profilen
+    # unterschiedlich gesetzt UND fahren verschiedene Testpersonen unter
+    # verschiedenen Profilen, sind ihre Rueckwaertszeiten nicht mehr direkt
+    # vergleichbar - ratio_rw_vw haengt dann am Profil statt an der Person.
+    # Entweder ueber die ganze Studie gleich lassen, oder die Profilzuordnung
+    # bewusst als Bedingung in die Auswertung aufnehmen.
+
+    # Fuer Testpersonen, die wenig Kraft haben, zittern oder langsamer
+    # reagieren. Im Fahrversuch justiert.
+    #
+    # Tempo 20 bis 80 statt 30 bis 120: Der Ball laeuft auch bei voll
+    # gesenkter Hand nicht davon. Das Grundtempo wirkt doppelt - es ist
+    # zugleich die Untergrenze des Kurventempos (calc_speed gibt nie 0
+    # zurueck), Kurven werden damit ebenfalls langsamer.
+    #
+    # Drehrate: 80 Grad je 0.36 s sind 222 Grad/s gegenueber 282 beim
+    # Standard. Trotz des GROESSEREN Winkels dreht er langsamer, weil der
+    # Bezugstakt staerker angehoben wurde - der grosse Winkel sorgt nur
+    # dafuer, dass anhaltendes Drehen weit genug traegt.
+    #
+    # Glaettung 0.05 und Halteband Fahren 0.01: der Zitterausgleich, den der
+    # Standard bewusst nicht hat. Bewusst niedrig dosiert - schon 0.05 s
+    # daempfen das Zucken, ohne dass sich die Steuerung schwammig anfuehlt.
+    #
+    # STOP_TIME bleibt bei 0.6: Kurzes Anheben der Hand beendet die Fahrt
+    # nicht sofort. Fuer eine unsichere Hand wichtiger als schnelles Anhalten,
+    # denn das Tempo geht ohnehin sofort auf 0 - STOP_TIME entscheidet nur,
+    # wann der Halt als endgueltig gilt.
     "Sanft": {
-        "MIN_SPEED_DYN": 20, "MAX_SPEED_DYN": 70,
+        "MIN_SPEED_DYN": 20, "MAX_SPEED_DYN": 80,
         "TURN_SPEED_FACTOR": 0.5,
-        "MAX_TURN_ANGLE_LEFT": 40, "MAX_TURN_ANGLE_RIGHT": 40,
-        "ROLL_COMMAND_DURATION": 0.08, "STOP_TIME": 0.8,
-        "BACKWARD_SPEED": 50,
+        "MAX_TURN_ANGLE_LEFT": 80, "MAX_TURN_ANGLE_RIGHT": 80,
+        "ROLL_COMMAND_DURATION": 0.04, "STOP_TIME": 0.6,
+        "BACKWARD_SPEED": 80,
         "STEUERMODUS": "rate",
-        "POS_MAX_OFFSET_LEFT": 45, "POS_MAX_OFFSET_RIGHT": 45,
-        "GLAETTUNG_TAU_S": 0.20, "GY_HYSTERESE": 0.06, "GX_HYSTERESE": 0.04,
-        "LENK_EXPO": 2.5, "LENK_TEMPO_KOPPLUNG": 0.7,
-        # Auch hier kein Budget: Es hat sich beim Fahren als hinderlicher
-        # erwiesen als hilfreich (Begründung bei LENK_MAX_DREHUNG). Wer es
-        # ausprobieren will, stellt es am Regler ein.
-        "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
+        "POS_MAX_OFFSET_LEFT": 90, "POS_MAX_OFFSET_RIGHT": 90,
+        "GLAETTUNG_TAU_S": 0.05, "GY_HYSTERESE": 0.08, "GX_HYSTERESE": 0.01,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
+        "LENK_BEZUGSTAKT_S": 0.36, "LENK_MAX_DREHUNG": 0,
     },
+
     # Der in den Testfahrten mit P05-P07 eingefahrene Stand.
     #
     # Kurven-Tempo 0.5 statt 0.8: Die Rueckmeldung aus allen drei Testfahrten
@@ -582,37 +621,53 @@ FAHRPROFILE = {
     #
     # Glaettung 0.0 statt 0.15: Die 0.15 s waren als Zitterausgleich gedacht,
     # haben sich aber als spuerbare Verzoegerung zwischen Hand und Ball
-    # bemerkbar gemacht. Gegen Zittern bleiben die beiden Haltebänder.
+    # bemerkbar gemacht. Gegen Zittern bleiben die beiden Haltebaender.
     #
     # Kippschwellen bei 0.50 (statt 0.60/0.72): Die Kurve beginnt frueher, das
     # Handgelenk muss weniger weit drehen. In den Testfahrten war die weite
     # Drehung schmerzhaft - bei der Zielgruppe ist das ein Ausschlusskriterium,
-    # kein Komfortthema. Die Schwellen sind bewusst symmetrisch, obwohl Aus-
-    # und Einwaertsdrehung des Unterarms es nicht sind; wer sie je Person
-    # anpasst, verstellt sie im Fahrverhalten-Fenster und sichert sie dort.
+    # kein Komfortthema. Die Schwellen liegen NICHT im Profil, sie gehoeren zur
+    # Person; die Vorgabe steht oben bei GY_LEFT_THRESHOLD.
     "Standard": {
         "MIN_SPEED_DYN": 30, "MAX_SPEED_DYN": 120,
         "TURN_SPEED_FACTOR": 0.5,
-        "MAX_TURN_ANGLE_LEFT": 62, "MAX_TURN_ANGLE_RIGHT": 61,
-        "ROLL_COMMAND_DURATION": 0.06, "STOP_TIME": 0.6,
+        "MAX_TURN_ANGLE_LEFT": 65, "MAX_TURN_ANGLE_RIGHT": 65,
+        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.5,
         "BACKWARD_SPEED": 80,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 60, "POS_MAX_OFFSET_RIGHT": 60,
-        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.12, "GX_HYSTERESE": 0.0,
+        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
         "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
-        "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
+        "LENK_BEZUGSTAKT_S": 0.30, "LENK_MAX_DREHUNG": 0,
     },
+
+    # Fuer Testpersonen, die sich sicher fuehlen und mehr Tempo wollen.
+    # Im Fahrversuch justiert; ausgehend vom Standard in jeder Groesse in
+    # Richtung "schneller und direkter" verstellt.
+    #
+    # Drehrate: 90 Grad je 0.3 s sind 300 Grad/s gegenueber 282 beim Standard.
+    # Der groessere Winkel wird also fast vollstaendig durch den laengeren
+    # Bezugstakt aufgewogen - was hier wirklich zunimmt, ist der ERREICHBARE
+    # Gesamtwinkel bei anhaltender Handdrehung, nicht die Drehgeschwindigkeit.
+    #
+    # GY_HYSTERESE 0.0 statt 0.12: Das Halteband gegen Zittern ist bewusst
+    # abgeschaltet, die Kurve endet damit genau an der Kippschwelle. Das macht
+    # die Lenkung unmittelbarer, setzt aber eine ruhige Hand voraus - fuer
+    # zittrige Haende ist dieses Profil ungeeignet, dafuer gibt es "Sanft".
+    #
+    # STOP_TIME 0.3 statt 0.6: Haelt schneller endgueltig an, reagiert dafuer
+    # empfindlicher auf kurzes Anheben der Hand.
     "Sportlich": {
-        "MIN_SPEED_DYN": 45, "MAX_SPEED_DYN": 200,
-        "TURN_SPEED_FACTOR": 0.85,
-        "MAX_TURN_ANGLE_LEFT": 75, "MAX_TURN_ANGLE_RIGHT": 75,
-        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.4,
-        "BACKWARD_SPEED": 110,
+        "MIN_SPEED_DYN": 45, "MAX_SPEED_DYN": 150,
+        "TURN_SPEED_FACTOR": 0.5,
+        "MAX_TURN_ANGLE_LEFT": 90, "MAX_TURN_ANGLE_RIGHT": 90,
+        "ROLL_COMMAND_DURATION": 0.04, "STOP_TIME": 0.3,
+        "BACKWARD_SPEED": 80,
         "STEUERMODUS": "rate",
-        "POS_MAX_OFFSET_LEFT": 75, "POS_MAX_OFFSET_RIGHT": 75,
-        "GLAETTUNG_TAU_S": 0.05, "GY_HYSTERESE": 0.02, "GX_HYSTERESE": 0.01,
-        "LENK_EXPO": 1.8, "LENK_TEMPO_KOPPLUNG": 0.5,
-        "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
+        "POS_MAX_OFFSET_LEFT": 70, "POS_MAX_OFFSET_RIGHT": 70,
+        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
+        "LENK_BEZUGSTAKT_S": 0.3, "LENK_MAX_DREHUNG": 0,
     },
 }
 
