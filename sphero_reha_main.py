@@ -170,7 +170,7 @@ graph_time_values = deque(maxlen=MAX_POINTS)
 # gefahren werden kann, ohne dass am Code etwas geändert werden muss.
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
-TURN_SPEED_FACTOR    = 0.8
+TURN_SPEED_FACTOR    = 0.5
 
 # Handneigung, bei der das Höchsttempo erreicht ist (Hand weit nach unten
 # gekippt). Zusammen mit GX_FORWARD_MAX spannt dieser Wert die Tempo-Rampe auf:
@@ -195,8 +195,8 @@ STOP_TIME            = 0.6
 # Links liegt bewusst NIEDRIGER als rechts: Bei am Handgelenk getragener Uhr
 # ist die Drehung in die eine Richtung anatomisch schwerer zu erreichen als in
 # die andere. Wer stattdessen symmetrisch fahren möchte, setzt beide auf 0.80.
-GY_RIGHT_THRESHOLD   = -0.72
-GY_LEFT_THRESHOLD    = +0.60
+GY_RIGHT_THRESHOLD   = -0.50
+GY_LEFT_THRESHOLD    = +0.50
 GX_FORWARD_MAX       = +0.1
 GX_NEUTRAL_THRESHOLD = +0.12
 # Maximaler Drehwinkel je Lenkschritt, getrennt je Seite.
@@ -210,8 +210,8 @@ GX_NEUTRAL_THRESHOLD = +0.12
 # "Je Lenkschritt" heißt seit der Umstellung auf die zeitbasierte Drehrate:
 # je LENK_BEZUGSTAKT_S Sekunden (siehe dort), NICHT mehr je tatsächlichem
 # Schleifendurchlauf.
-MAX_TURN_ANGLE_RIGHT = 60
-MAX_TURN_ANGLE_LEFT  = 60
+MAX_TURN_ANGLE_RIGHT = 61
+MAX_TURN_ANGLE_LEFT  = 62
 
 # ── Zeitbasierte Drehrate ────────────────────────────────────────────────────
 # Taktzeit, auf die sich MAX_TURN_ANGLE_* bezieht.
@@ -378,7 +378,7 @@ LENK_TEMPO_KOPPLUNG = 1.0
 # ist, nach drei zu 95 %. Bei rund 100 ms Zykluszeit bleibt die Steuerung damit
 # deutlich schneller als die menschliche Reaktion, während Zittern im Bereich
 # mehrerer Hertz stark gedämpft wird (gemessen: auf 22 % der Schwankungsbreite).
-GLAETTUNG_TAU_S = 0.15
+GLAETTUNG_TAU_S = 0.0
 
 # ── Hysterese der Kippschwellen ──────────────────────────────────────────────
 # Zusatzweg, den die Hand zurücklegen muss, um einen Dreh- oder Fahrzustand
@@ -428,6 +428,59 @@ GX_HYSTERESE = 0.0
 # kürzerer Abstand vertretbar und macht die Steuerung spürbar direkter.
 # Wird beim Verbinden auf die Toy-Instanz gesetzt (siehe control_sphero).
 SPHERO_CMD_INTERVAL_S = 0.04
+
+# ── Richtungspfeil auf der LED-Matrix ────────────────────────────────────────
+#
+# Rueckmeldung aus den Testfahrten P05-P07: Man sieht dem leuchtenden Ball
+# nicht an, wo bei ihm "vorne" ist. Wer die Hand hebt, weiss deshalb nicht, in
+# welche Richtung er gleich losfaehrt - und korrigiert erst, nachdem der Ball
+# schon in die falsche Richtung gerollt ist.
+#
+# Der BOLT hat eine 8x8-LED-Matrix, die fest auf dem inneren Chassis sitzt.
+# Dreht die Steuerung den Kurs, dreht sich das Chassis und damit die Matrix
+# mit. Ein Pfeil, der auf der Matrix immer nach "oben" zeigt, zeigt am Ball
+# also immer in die aktuelle Fahrtrichtung, ohne dass ein einziges zusaetzliches
+# Paket noetig waere, wenn sich der Kurs aendert.
+MATRIX_PFEIL_AN = True
+
+# Der Pfeil traegt die Zustandsfarbe selbst, der Rest der Matrix bleibt
+# dunkel. Frueher wurde die GANZE Matrix in der Zustandsfarbe gefuellt und der
+# Pfeil weiss darueber gelegt - das kostete bei jedem Zustandswechsel ein
+# Fuellpaket zusaetzlich, und weil das Fuellen den Pfeil jedes Mal loeschte,
+# war er nach jedem Wechsel kurz gar nicht da.
+#
+# Links und rechts sind bewusst BLAU und GELB und nicht rot/gruen: Die
+# Rot-Gruen-Schwaeche ist die mit Abstand haeufigste Farbsehschwaeche, Blau
+# gegen Gelb dagegen fuer praktisch jeden unterscheidbar. Bei der Richtung
+# darf es keinen Zweifel geben - Fahren und Halt sind zusaetzlich ueber die
+# Bewegung erkennbar, links und rechts nicht.
+MATRIX_PFEIL_FARBEN = {
+    "forward":   (0, 255, 0),      # gruen  - geradeaus
+    "right":     (255, 210, 0),    # gelb   - Rechtskurve
+    "left":      (0, 90, 255),     # blau   - Linkskurve
+    "stop":      (255, 0, 0),      # rot    - steht
+    "backward":  (160, 0, 255),    # violett- Rueckwaertsfahrt
+    "bereit":    (255, 255, 255),  # weiss  - verbunden, wartet
+}
+
+# Vierteldrehungen im Uhrzeigersinn, mit denen der Pfeil auf die tatsaechliche
+# Einbaulage der Matrix gedreht wird.
+#
+# 180 Grad ist kein Vorschlagswert, sondern am Ball ausgemessen: Bei 0 Grad
+# zeigte der Pfeil nach HINTEN. Die Zeile y=0 der Matrix liegt beim BOLT also
+# auf der Rueckseite, nicht in Fahrtrichtung.
+#
+# Nachpruefen, falls je ein anderer Ball verwendet wird: Ball hinlegen, kurz
+# vorwaerts fahren lassen und schauen, wohin der Pfeil zeigt. Umstellen laesst
+# sich das zur Laufzeit im Fenster "Fahrverhalten", Abschnitt 7.
+MATRIX_PFEIL_DREHUNG = 180
+
+# Wird gesetzt, wenn die Oberflaeche Pfeilfarbe, -drehung oder -zustand
+# geaendert hat. Die Steuerungsschleife baut das Bild dann im naechsten
+# Durchlauf neu auf. Ueber ein Signal und nicht durch direktes Zeichnen aus
+# der Oberflaeche heraus, weil auf der BLE-Verbindung immer nur EIN Thread
+# senden darf - sonst zuckt der Ball zwischen zwei Befehlsstroemen.
+pfeil_neu_zeichnen = threading.Event()
 
 # ── Fahrbefehle nur bei Änderung senden ──────────────────────────────────────
 # Ein wiederholtes "fahre Kurs 90 mit Tempo 60" ändert am Ball nichts, kostet
@@ -518,16 +571,34 @@ FAHRPROFILE = {
         # ausprobieren will, stellt es am Regler ein.
         "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
     },
-    # Der in den Testfahrten eingefahrene Stand.
+    # Der in den Testfahrten mit P05-P07 eingefahrene Stand.
+    #
+    # Kurven-Tempo 0.5 statt 0.8: Die Rueckmeldung aus allen drei Testfahrten
+    # war, dass er die Kurve schlecht nimmt. Ursache war nicht zu langsames
+    # Drehen, sondern zu hohes Tempo IN der Kurve - er fuhr einen weiten Bogen,
+    # wo ein enger gebraucht wurde. Der Ball ist damit in Kurven sichtbar
+    # langsamer; das ist gewollt und nicht mit einer traegeren Steuerung zu
+    # verwechseln.
+    #
+    # Glaettung 0.0 statt 0.15: Die 0.15 s waren als Zitterausgleich gedacht,
+    # haben sich aber als spuerbare Verzoegerung zwischen Hand und Ball
+    # bemerkbar gemacht. Gegen Zittern bleiben die beiden Haltebänder.
+    #
+    # Kippschwellen bei 0.50 (statt 0.60/0.72): Die Kurve beginnt frueher, das
+    # Handgelenk muss weniger weit drehen. In den Testfahrten war die weite
+    # Drehung schmerzhaft - bei der Zielgruppe ist das ein Ausschlusskriterium,
+    # kein Komfortthema. Die Schwellen sind bewusst symmetrisch, obwohl Aus-
+    # und Einwaertsdrehung des Unterarms es nicht sind; wer sie je Person
+    # anpasst, verstellt sie im Fahrverhalten-Fenster und sichert sie dort.
     "Standard": {
         "MIN_SPEED_DYN": 30, "MAX_SPEED_DYN": 120,
-        "TURN_SPEED_FACTOR": 0.8,
-        "MAX_TURN_ANGLE_LEFT": 60, "MAX_TURN_ANGLE_RIGHT": 60,
+        "TURN_SPEED_FACTOR": 0.5,
+        "MAX_TURN_ANGLE_LEFT": 62, "MAX_TURN_ANGLE_RIGHT": 61,
         "ROLL_COMMAND_DURATION": 0.06, "STOP_TIME": 0.6,
         "BACKWARD_SPEED": 80,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 60, "POS_MAX_OFFSET_RIGHT": 60,
-        "GLAETTUNG_TAU_S": 0.15, "GY_HYSTERESE": 0.12, "GX_HYSTERESE": 0.0,
+        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.12, "GX_HYSTERESE": 0.0,
         "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
         "LENK_BEZUGSTAKT_S": 0.22, "LENK_MAX_DREHUNG": 0,
     },
@@ -2149,6 +2220,172 @@ class _SpheroCommandGuard:
         return result.get("value")
 
 
+class _MatrixPfeil:
+    """
+    Zeichnet einen Richtungspfeil auf die 8x8-Matrix des BOLT.
+
+    Das Problem, das diese Klasse loest, ist nicht das Zeichnen, sondern der
+    Funkverkehr. set_main_led() faerbt beim BOLT die GESAMTE Matrix ein
+    (ToyUtil.set_main_led -> set_led_matrix_one_colour) - jeder Farbwechsel des
+    Fahrzustands loescht den Pfeil also wieder. Er muss danach neu gezeichnet
+    werden, und dafuer sind mehrere Pakete noetig: eine Linie je Zeile der
+    Pfeilspitze plus ein Rechteck fuer den Schaft.
+
+    Wuerden die alle sofort hinterher geschickt, haenge die Steuerung bei jedem
+    Zustandswechsel fuer die Dauer von fuenf Paketen - genau die Verzoegerung
+    zwischen Handbewegung und Reaktion, die in den Tests ohnehin schon
+    bemerkt wurde.
+
+    Deshalb liegen die Zeichenbefehle in einer Warteschlange und es geht je
+    Schleifendurchlauf hoechstens EINER davon raus. Der erste wird beim
+    Farbwechsel sofort gesendet - so viel hat der Wechsel auch gekostet, als
+    noch die ganze Matrix gefuellt wurde -, die restlichen vier verteilen sich
+    auf die naechsten Durchlaeufe.
+
+    Fuer die Testperson ist das kein Notbehelf, sondern die Anzeige selbst: Die
+    neue Farbe laeuft vom Schaft zur Spitze durch den Pfeil. Ein Farbwechsel
+    ist dadurch auch aus dem Augenwinkel als Bewegung wahrnehmbar, waehrend ein
+    schlagartiger Wechsel leicht uebersehen wird.
+
+    Warum in JEDEM Durchlauf und nicht nur in Sendepausen: Genau das war die
+    erste Fassung, und sie ist im Fahrversuch durchgefallen. Solange
+    ununterbrochen gelenkt wird, geht jedes Paket ans Fahren - es entsteht
+    keine Pause, die Warteschlange verhungert, und der Pfeil bleibt auf halbem
+    Weg stehen: Schaft schon in der neuen Farbe, Kopf noch in der alten, die
+    Spitze oft gar nicht gezeichnet. Die Warteschlange ist auf fuenf Befehle
+    begrenzt und fuellt sich nur bei einem Zustandswechsel; der Aufschlag
+    beschraenkt sich also auf die vier Durchlaeufe nach dem Wechsel.
+    """
+
+    # Der Pfeil in Matrixkoordinaten, y=0 ist die Fahrtrichtung. Bewusst
+    # grossflaechig: Durch die Kugelschale gesehen verschwimmen die einzelnen
+    # Leuchtpunkte, eine duenne Linie waere aus zwei Metern nicht mehr als
+    # Richtung erkennbar.
+    #
+    #   . . . # # . . .      Spitze
+    #   . . # # # # . .
+    #   . # # # # # # .
+    #   # # # # # # # #      Widerhaken
+    #   . . . # # . . .      Schaft
+    #   . . . # # . . .
+    #   . . . # # . . .
+    #   . . . # # . . .
+    #
+    # Der Kopf laeuft ueber vier Baender von 8 auf 2 Pixel zu. Zwei und nicht
+    # eines, weil die Matrix acht Spalten hat: Eine mittige Reihe gibt es auf
+    # geradzahliger Breite nicht, ein einzelnes Pixel saesse sichtbar
+    # ausserhalb der Achse. Durch die Kugelschale verlaufen zwei Punkte
+    # ohnehin zu einer Spitze.
+    #
+    # Reihenfolge ist Absicht: Der Schaft steht zuerst, weil er die groesste
+    # zusammenhaengende Flaeche ist. Von einem Farbwechsel geht nur das erste
+    # Paket sofort raus, der Rest verteilt sich auf die naechsten Durchlaeufe -
+    # so traegt schon das erste Paket den groessten Teil der neuen Farbe, und
+    # die Farbe laeuft sichtbar bis in die Spitze durch.
+    # Ausschliesslich gefuellte Rechtecke, auch fuer die einzeiligen Baender
+    # des Pfeilkopfs. set_matrix_line erwartet seine Punkte in aufsteigender
+    # Reihenfolge; nach einer Drehung um 180 Grad standen sie absteigend da,
+    # und die betroffenen Zeilen wurden schlicht nicht gezeichnet - deshalb
+    # fehlte am Ball die Pfeilspitze. Ein Rechteck laesst sich dagegen
+    # zuverlaessig normalisieren (min/max in _senden), egal wie gedreht wurde.
+    _FORM = (
+        ("fuell", 3, 4, 4, 7),   # Schaft
+        ("fuell", 0, 3, 7, 3),   # Widerhaken, volle Breite
+        ("fuell", 1, 2, 6, 2),   # Kopf, 6 breit
+        ("fuell", 2, 1, 5, 1),   # Kopf, 4 breit
+        ("fuell", 3, 0, 4, 0),   # Spitze, 2 breit
+    )
+
+    # Wie oft ein einzelner Zeichenbefehl wiederholt wird, bevor er aufgegeben
+    # wird. Ein belegter Funkkanal ist der Normalfall und darf nicht dazu
+    # fuehren, dass eine Linie des Pfeils fehlt; ein Befehl, den dieser Ball
+    # gar nicht kennt, darf die Warteschlange aber auch nicht ewig blockieren.
+    MAX_VERSUCHE = 3
+
+    def __init__(self, api, guard):
+        self._api      = api
+        self._guard    = guard
+        self._offen    = []    # noch zu sendende Zeichenbefehle
+        self._versuche = 0     # Fehlversuche am vordersten Befehl
+        self._farbe    = MATRIX_PFEIL_FARBEN["bereit"]
+        self.pakete    = 0
+
+    @staticmethod
+    def _drehen(x, y, viertel):
+        """Einen Punkt um Vielfache von 90 Grad im Uhrzeigersinn drehen."""
+        for _ in range(viertel):
+            x, y = 7 - y, x
+        return x, y
+
+    def faerben(self, r, g, b):
+        """
+        Den Pfeil in einer neuen Farbe anfordern.
+
+        Die Pixel bleiben dieselben, nur ihre Farbe aendert sich - es muss also
+        nichts geloescht werden. Faellt ein Paket aus, steht der Pfeil kurz
+        zweifarbig da, verschwindet aber nie.
+        """
+        if not MATRIX_PFEIL_AN:
+            self.aus()
+            return
+        self._farbe    = (int(r), int(g), int(b))
+        self._offen    = list(self._FORM)
+        self._versuche = 0
+
+    def loeschen(self):
+        """Matrix dunkel schalten - beim Abschalten der Steuerung."""
+        self._offen    = [("leeren", 0, 0, 0, 0)]
+        self._versuche = 0
+
+    def aus(self):
+        """Nichts mehr zeichnen - beim Abschalten und beim Ausrichten."""
+        self._offen    = []
+        self._versuche = 0
+
+    @property
+    def offen(self) -> int:
+        return len(self._offen)
+
+    def schritt(self) -> bool:
+        """
+        Hoechstens einen Zeichenbefehl senden.
+
+        Rueckgabe: True, wenn ein Paket rausging. Fehler werden bewusst
+        geschluckt - ein nicht gezeichneter Pfeil ist eine fehlende Hilfe,
+        kein Grund, eine laufende Fahrt zu stoeren.
+        """
+        if not self._offen or not MATRIX_PFEIL_AN:
+            return False
+        art, x1, y1, x2, y2 = self._offen[0]
+        viertel = (int(MATRIX_PFEIL_DREHUNG) // 90) % 4
+        x1, y1 = self._drehen(x1, y1, viertel)
+        x2, y2 = self._drehen(x2, y2, viertel)
+        farbe = Color(r=self._farbe[0], g=self._farbe[1], b=self._farbe[2])
+        try:
+            if art == "leeren":
+                self._guard.call(self._api.clear_matrix)
+            else:
+                # Nach dem Drehen koennen die Ecken vertauscht sein; die API
+                # erwartet die linke obere zuerst.
+                self._guard.call(self._api.set_matrix_fill,
+                                 min(x1, x2), min(y1, y2),
+                                 max(x1, x2), max(y1, y2), farbe)
+        except Exception:
+            # Meist nur ein belegter Funkkanal. Denselben Befehl im naechsten
+            # Durchlauf noch einmal versuchen, sonst fehlte dem Pfeil dauerhaft
+            # ein Band. Erst nach mehreren Fehlversuchen aufgeben - sonst
+            # blieben Baelle ohne LED-Matrix in dieser Warteschlange haengen.
+            self._versuche += 1
+            if self._versuche >= self.MAX_VERSUCHE:
+                self._offen.pop(0)
+                self._versuche = 0
+            return False
+        self._offen.pop(0)
+        self._versuche = 0
+        self.pakete += 1
+        return True
+
+
 class _SpheroDrive:
     """
     Fahrbefehle an den Sphero – ein Befehl, ein BLE-Paket, und nur wenn er etwas
@@ -2462,6 +2699,7 @@ def control_sphero():
                 was_backward         = False
                 guard                = _SpheroCommandGuard()
                 drive                = _SpheroDrive(sphero, guard)
+                pfeil                = _MatrixPfeil(sphero, guard)
                 current_led          = None
                 # Zeitpunkt des vorigen Lenkschritts – Grundlage der
                 # zeitbasierten Drehrate (siehe LENK_BEZUGSTAKT_S).
@@ -2478,16 +2716,39 @@ def control_sphero():
                 takt_letzte_meldung  = time.time()
 
                 def set_led(r, g, b):
-                    # LED nur bei Farbwechsel senden – vorher wurde dieselbe
-                    # Farbe bei jedem Schleifendurchlauf erneut gefunkt und
-                    # hat den BLE-Verkehr unnötig aufgebläht.
+                    # Nur bei Farbwechsel senden – vorher wurde dieselbe Farbe
+                    # bei jedem Schleifendurchlauf erneut gefunkt und hat den
+                    # BLE-Verkehr unnötig aufgebläht.
                     nonlocal current_led
-                    if current_led != (r, g, b):
+                    if current_led == (r, g, b):
+                        return
+                    current_led = (r, g, b)
+
+                    if not MATRIX_PFEIL_AN:
+                        # Pfeil abgeschaltet: das frühere Verhalten – die ganze
+                        # Matrix leuchtet in der Zustandsfarbe. Bleibt als
+                        # Vergleichsmöglichkeit erhalten, damit sich beide
+                        # Darstellungen im Fahrversuch gegeneinander stellen
+                        # lassen, ohne den Code zu ändern.
                         guard.call(sphero.set_main_led, Color(r=r, g=g, b=b))
-                        current_led = (r, g, b)
+                        pfeil.aus()
+                        return
+
+                    if (r, g, b) == (0, 0, 0):
+                        pfeil.loeschen()
+                    else:
+                        pfeil.faerben(r, g, b)
+                    # Genau EIN Paket sofort – so viel hat der Farbwechsel auch
+                    # gekostet, als noch die ganze Matrix gefüllt wurde. Der
+                    # Rest des Pfeils füllt Sendepausen und hält die Steuerung
+                    # damit nicht auf.
+                    try:
+                        pfeil.schritt()
+                    except Exception:
+                        pass
 
                 guard.call(sphero.set_heading, sphero_heading)
-                set_led(255, 255, 255)
+                set_led(*MATRIX_PFEIL_FARBEN["bereit"])
 
                 if reconnect_count == 0:
                     set_status("Sphero verbunden. Sensor-App kann Daten senden.")
@@ -2499,6 +2760,24 @@ def control_sphero():
 
                 while not stop_sphero.is_set():
                     schritt_start = time.time()
+                    # Pfeil wurde im Fenster "Fahrverhalten" verstellt.
+                    # Bei einer geaenderten Drehung liegt der alte Pfeil noch
+                    # an seiner alten Stelle - er muss geloescht werden, sonst
+                    # stehen zwei Pfeile gleichzeitig auf der Matrix. Ein
+                    # blosses Neufaerben genuegt hier also nicht.
+                    if pfeil_neu_zeichnen.is_set():
+                        pfeil_neu_zeichnen.clear()
+                        farbe_jetzt = current_led or MATRIX_PFEIL_FARBEN["bereit"]
+                        current_led = None      # erzwingt echtes Neusenden
+                        try:
+                            pfeil.loeschen()
+                            pfeil.schritt()     # Loeschen sofort ausfuehren
+                        except Exception:
+                            pass
+                        try:
+                            set_led(*farbe_jetzt)
+                        except Exception:
+                            pass
 
                     # ── Ausrichten: Sphero an die Oberfläche abgeben ──────────
                     # Solange ausgerichtet wird, darf diese Schleife nichts
@@ -2513,6 +2792,9 @@ def control_sphero():
                             pass
                         is_stopped  = True
                         current_led = None      # Farbe nach dem Ausrichten neu setzen
+                        # Der halb gezeichnete Pfeil gehoert zum alten Bild und
+                        # wird nach dem Ausrichten ohnehin neu angefordert.
+                        pfeil.aus()
                         aim_active.set()
                         while aim_request.is_set() and not stop_sphero.is_set():
                             time.sleep(0.05)
@@ -2554,7 +2836,7 @@ def control_sphero():
                                 # Akku) die Versorgungsspannung einbrechen
                                 # und die BLE-Verbindung abreißen lassen kann.
                                 drive.halte(sphero_heading)
-                                set_led(160, 0, 255)
+                                set_led(*MATRIX_PFEIL_FARBEN["backward"])
                                 time.sleep(0.3)
                                 was_backward = True
                             backward_heading = (sphero_heading + 180) % 360
@@ -2562,7 +2844,7 @@ def control_sphero():
                             # Stopp am Ende. Der Ball rollt gleichmäßig zurück,
                             # statt in der Rückwärtsfahrt zu stottern.
                             drive.fahre(backward_heading, BACKWARD_SPEED)
-                            set_led(160, 0, 255)
+                            set_led(*MATRIX_PFEIL_FARBEN["backward"])
                             last_move_time = time.time()
                             is_stopped     = False
                             consecutive_failures = 0
@@ -2665,10 +2947,16 @@ def control_sphero():
                             # Kurvenfarbe angezeigt: Die Testperson sieht ohne
                             # Erklärung, dass weiteres Halten der Hand nichts
                             # mehr bewirkt und sie zurückdrehen muss.
+                            # Aufgebrauchtes Budget wird gedimmt gezeigt:
+                            # dieselbe Farbe, nur dunkler – die Richtung bleibt
+                            # damit ablesbar, während die Testperson sieht, dass
+                            # weiteres Halten nichts mehr bewirkt.
+                            grund = MATRIX_PFEIL_FARBEN[
+                                "right" if state == "right" else "left"]
                             if budget_erschoepft:
-                                set_led(*((90, 35, 0) if state == "right" else (0, 70, 90)))
+                                set_led(*(k // 3 for k in grund))
                             else:
-                                set_led(*((255, 100, 0) if state == "right" else (0, 200, 255)))
+                                set_led(*grund)
                             last_move_time = time.time()
                             is_stopped     = False
                             with data_lock:
@@ -2688,7 +2976,7 @@ def control_sphero():
                             dreh_budget       = 0.0
                             budget_erschoepft = False
                             drive.fahre(sphero_heading, applied_speed)
-                            set_led(0, 255, 0)
+                            set_led(*MATRIX_PFEIL_FARBEN["forward"])
                             last_move_time = time.time()
                             is_stopped     = False
 
@@ -2723,7 +3011,7 @@ def control_sphero():
                                 # zu verzögern.
                                 drive.halte(sphero_heading)
                                 is_stopped = True
-                                set_led(255, 0, 0)
+                                set_led(*MATRIX_PFEIL_FARBEN["stop"])
 
                         consecutive_failures = 0
                         consecutive_overload = 0
@@ -2752,6 +3040,30 @@ def control_sphero():
                         else:
                             # Andere Fehler: loggen, aber weiterlaufen
                             print(f"[WARN] Sphero-Befehl fehlgeschlagen: {e}")
+
+                    # ── Richtungspfeil in der Sendepause nachziehen ───────────
+                    # Ein Zeichenbefehl je Durchlauf, bis der Pfeil fertig ist -
+                    # bewusst auch dann, wenn in diesem Durchlauf schon ein
+                    # Fahrpaket rausging. Die frühere Fassung zeichnete nur in
+                    # Sendepausen und ließ den Pfeil deshalb genau dann
+                    # unfertig, wenn ununterbrochen gelenkt wurde: Schaft neu
+                    # eingefärbt, Kopf noch in der alten Farbe.
+                    #
+                    # Die Warteschlange ist fünf Befehle lang und füllt sich nur
+                    # bei einem Zustandswechsel. Teurer wird es also nur in den
+                    # vier Durchläufen nach einem Wechsel – und genau die zeigen
+                    # den Farbverlauf durch den Pfeil.
+                    #
+                    # Ausnahme: Läuft die Steuerung ohnehin schon deutlich zu
+                    # langsam, hat das Fahren Vorrang und die Anzeige wartet.
+                    # Die Rückmeldung darf die Ursache nicht verschlimmern.
+                    schleife_gesund = (takt_mittel <= 0.0
+                                       or takt_mittel < 2.5 * ROLL_COMMAND_DURATION)
+                    if pfeil.offen and schleife_gesund:
+                        try:
+                            pfeil.schritt()
+                        except _BefehlUeberlastet:
+                            pass
 
                     recorder.log_control(gx, gy, gz, state, sphero_heading, applied_speed, is_stopped)
 
@@ -5146,6 +5458,47 @@ class DrivingTuneWindow:
                      was="Dasselbe fuer Fahren und Anhalten: wie weit die Hand ueber die "
                          "Fahrschwelle zurueck muss, damit die Fahrt endet.")
 
+        self._abschnitt(main, "7  Richtungspfeil am Ball")
+        ttk.Label(main,
+                  text="Der Ball zeigt auf seiner LED-Matrix einen Pfeil in die Richtung, "
+                       "in die er losfahren wuerde; der Rest der Matrix bleibt dunkel. "
+                       "Der Pfeil traegt zugleich die Zustandsfarbe: gruen geradeaus, "
+                       "gelb Rechtskurve, blau Linkskurve, rot steht, violett rueckwaerts. "
+                       "Links und rechts sind blau und gelb statt rot und gruen, weil die "
+                       "Rot-Gruen-Schwaeche haeufig ist und bei der Richtung kein Zweifel "
+                       "entstehen darf.\n"
+                       "Abgeschaltet leuchtet stattdessen wieder die ganze Matrix in der "
+                       "Zustandsfarbe, so lassen sich beide Darstellungen im Fahrversuch "
+                       "gegeneinander stellen.\n"
+                       "Welche Kante der Matrix nach vorne zeigt, haengt an der "
+                       "Einbaulage. Ball auf den Boden legen, kurz vorwaerts fahren "
+                       "lassen und die Drehung so waehlen, dass der Pfeil in die "
+                       "Fahrtrichtung zeigt. Der Wert bleibt danach fuer die ganze "
+                       "Studie gleich.",
+                  foreground="#555", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+
+        self.var_pfeil_an = tk.BooleanVar(value=bool(MATRIX_PFEIL_AN))
+        ttk.Checkbutton(main, text="Richtungspfeil anzeigen",
+                        variable=self.var_pfeil_an,
+                        command=self._pfeil_uebernehmen).pack(anchor="w")
+
+        pfeil_zeile = ttk.Frame(main)
+        pfeil_zeile.pack(fill="x", pady=(4, 0))
+        ttk.Label(pfeil_zeile, text="Drehung:").pack(side="left")
+        self.var_pfeil_drehung = tk.IntVar(value=int(MATRIX_PFEIL_DREHUNG))
+        for grad, richtung in ((0, "nach oben"), (90, "nach rechts"),
+                               (180, "nach unten"), (270, "nach links")):
+            ttk.Radiobutton(pfeil_zeile, text=f"{grad}\u00b0 ({richtung})",
+                            value=grad, variable=self.var_pfeil_drehung,
+                            command=self._pfeil_uebernehmen).pack(side="left",
+                                                                  padx=(8, 0))
+        ttk.Label(main,
+                  text="Die Richtungsangabe beschreibt, wohin der Pfeil auf der Matrix "
+                       "gedreht wird – nicht, wohin der Ball faehrt.",
+                  foreground="#777", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+
         # ── Live-Anzeige ──────────────────────────────────────────────────────
         ttk.Separator(main).pack(fill="x", pady=(12, 8))
         self.live_var = tk.StringVar(value="Warte auf Sensordaten...")
@@ -5248,6 +5601,25 @@ class DrivingTuneWindow:
         wert.config(text=f"{variable.get():.{nachkomma}f}")
 
     # ── Wirkung ───────────────────────────────────────────────────────────────
+
+    def _pfeil_uebernehmen(self):
+        """
+        Pfeileinstellung sofort wirksam machen.
+
+        Bewusst getrennt von _uebernehmen: Der Pfeil ist reine Anzeige und
+        veraendert das Fahrverhalten nicht. Wuerde er ueber dieselbe Methode
+        laufen, wuerde jedes Umschalten der Pfeilrichtung das Fahrprofil auf
+        "von Hand eingestellt" setzen und in der Auswertung wie eine Aenderung
+        am Fahrverhalten aussehen.
+        """
+        global MATRIX_PFEIL_AN, MATRIX_PFEIL_DREHUNG
+        MATRIX_PFEIL_AN      = bool(self.var_pfeil_an.get())
+        MATRIX_PFEIL_DREHUNG = int(self.var_pfeil_drehung.get())
+        pfeil_neu_zeichnen.set()
+        recorder.log_event(
+            "richtungspfeil",
+            f"{'an' if MATRIX_PFEIL_AN else 'aus'}; "
+            f"Drehung {MATRIX_PFEIL_DREHUNG} Grad")
 
     def _uebernehmen(self, profil: str = PROFIL_MANUELL):
         """
