@@ -170,7 +170,7 @@ graph_time_values = deque(maxlen=MAX_POINTS)
 # gefahren werden kann, ohne dass am Code etwas geändert werden muss.
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
-TURN_SPEED_FACTOR    = 0.5
+TURN_SPEED_FACTOR    = 0.6
 
 # Handneigung, bei der das Höchsttempo erreicht ist (Hand weit nach unten
 # gekippt). Zusammen mit GX_FORWARD_MAX spannt dieser Wert die Tempo-Rampe auf:
@@ -195,10 +195,49 @@ STOP_TIME            = 0.6
 # Links liegt bewusst NIEDRIGER als rechts: Bei am Handgelenk getragener Uhr
 # ist die Drehung in die eine Richtung anatomisch schwerer zu erreichen als in
 # die andere. Wer stattdessen symmetrisch fahren möchte, setzt beide auf 0.80.
-GY_RIGHT_THRESHOLD   = -0.50
-GY_LEFT_THRESHOLD    = +0.50
-GX_FORWARD_MAX       = +0.1
+GY_RIGHT_THRESHOLD   = -0.38
+GY_LEFT_THRESHOLD    = +0.40
+# Fahrschwelle: Ab dieser Neigung faehrt der Sphero los.
+#
+# gx ist positiv bei angehobener und negativ bei gesenkter Hand. Gefahren wird,
+# sobald gx UNTER diesen Wert faellt (get_state) - ein hoeherer Wert heisst
+# also: er faehrt frueher los, die Hand muss weniger weit gesenkt werden.
+#
+# Warum einstellbar: Im Sitzen liegt der Unterarm anders als im Stehen, und wer
+# die Schulter nur eingeschraenkt bewegen kann, erreicht eine deutlich gesenkte
+# Hand gar nicht. Bei +0.1 muss die Hand ueber die Waagerechte hinaus nach
+# unten - fuer manche Testpersonen zu viel.
+#
+# ACHTUNG, wirkt doppelt: Die Schwelle ist zugleich der obere Anschlag der
+# Tempo-Rampe (calc_speed), die von hier bis GX_FULL_SPEED laeuft. Anheben hat
+# deshalb ZWEI Folgen, die sich nicht aufheben:
+#
+#   1. Die Rampe wird flacher, das Tempo laesst sich je Grad Neigung feiner
+#      dosieren. Von +0.10 auf +0.40 sinkt die Steigung von 86 auf 67
+#      Tempopunkte je 1.0 Neigung (bei Tempo 30 bis 120).
+#   2. An DERSELBEN Handhaltung faehrt er trotzdem schneller, weil die Rampe
+#      frueher beginnt und er an dieser Stelle schon weiter fortgeschritten
+#      ist: bei gx = -0.30 Tempo 76 statt 64.
+#
+# Wer die Schwelle fuers Sitzen anhebt, sollte deshalb das Hoechsttempo
+# gegenpruefen - sonst ist der Ball in der gewohnten Haltung unerwartet
+# schneller als vorher.
+#
+# Beide Groessen beschreiben denselben nutzbaren Neigungsbereich und duerfen
+# nicht auseinanderlaufen; deshalb dieselbe Konstante fuer Zustandserkennung
+# und Temporampe.
+GX_FORWARD_MAX       = +0.35
+
+# Obere Kante des Totbands zwischen Fahren und Stehen. Wird automatisch mit der
+# Fahrschwelle mitgefuehrt (siehe DrivingTuneWindow._anwenden), damit das
+# Totband erhalten bleibt, statt bei einer angehobenen Fahrschwelle zu
+# verschwinden.
 GX_NEUTRAL_THRESHOLD = +0.12
+
+# Abstand zwischen Fahrschwelle und Neutralschwelle. Ohne dieses Totband laege
+# die Grenze zwischen Fahren und Stehen auf einem einzigen Wert, und ein
+# Zittern um genau diesen Punkt wuerde staendig zwischen beiden umschalten.
+GX_TOTBAND = 0.02
 # Maximaler Drehwinkel je Lenkschritt, getrennt je Seite.
 # Getrennt, weil die Schwellen unterschiedlich sind: Rechts wird ab 0.80
 # gedreht, links schon ab 0.72. Der Winkel wird zwischen Schwelle und Vollaus-
@@ -210,8 +249,8 @@ GX_NEUTRAL_THRESHOLD = +0.12
 # "Je Lenkschritt" heißt seit der Umstellung auf die zeitbasierte Drehrate:
 # je LENK_BEZUGSTAKT_S Sekunden (siehe dort), NICHT mehr je tatsächlichem
 # Schleifendurchlauf.
-MAX_TURN_ANGLE_RIGHT = 61
-MAX_TURN_ANGLE_LEFT  = 62
+MAX_TURN_ANGLE_RIGHT = 65
+MAX_TURN_ANGLE_LEFT  = 65
 
 # ── Zeitbasierte Drehrate ────────────────────────────────────────────────────
 # Taktzeit, auf die sich MAX_TURN_ANGLE_* bezieht.
@@ -527,7 +566,7 @@ watch_arm = WATCH_ARM_LEFT        # zur Laufzeit über die Oberfläche umschaltb
 ROLL_COMMAND_DURATION = 0.06   # Sekunden – Hauptanteil des angestrebten Takts
 CONTROL_LOOP_SLEEP    = 0.04   # Sekunden – Restanteil des angestrebten Takts
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
-BACKWARD_SPEED    = 80    # Geschwindigkeit während der Rückwärtsfahrt
+BACKWARD_SPEED    = 50    # Geschwindigkeit während der Rückwärtsfahrt
 DATA_TIMEOUT      = 1.0   # Sekunden ohne Sensor-POST → Sphero gilt als "keine Daten", bleibt stehen
 
 # ── Fahrprofile ───────────────────────────────────────────────────────────────
@@ -602,7 +641,7 @@ FAHRPROFILE = {
         "TURN_SPEED_FACTOR": 0.5,
         "MAX_TURN_ANGLE_LEFT": 80, "MAX_TURN_ANGLE_RIGHT": 80,
         "ROLL_COMMAND_DURATION": 0.04, "STOP_TIME": 0.6,
-        "BACKWARD_SPEED": 80,
+        "BACKWARD_SPEED": 50,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 90, "POS_MAX_OFFSET_RIGHT": 90,
         "GLAETTUNG_TAU_S": 0.05, "GY_HYSTERESE": 0.08, "GX_HYSTERESE": 0.01,
@@ -633,7 +672,7 @@ FAHRPROFILE = {
         "TURN_SPEED_FACTOR": 0.5,
         "MAX_TURN_ANGLE_LEFT": 65, "MAX_TURN_ANGLE_RIGHT": 65,
         "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.5,
-        "BACKWARD_SPEED": 80,
+        "BACKWARD_SPEED": 50,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 60, "POS_MAX_OFFSET_RIGHT": 60,
         "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
@@ -690,6 +729,7 @@ def fahrverhalten_werte() -> dict:
     """
     return {
         "MIN_SPEED_DYN": MIN_SPEED_DYN, "MAX_SPEED_DYN": MAX_SPEED_DYN,
+        "GX_FORWARD_MAX": GX_FORWARD_MAX,
         "GX_FULL_SPEED": GX_FULL_SPEED,
         "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
         "MAX_TURN_ANGLE_LEFT": MAX_TURN_ANGLE_LEFT,
@@ -720,6 +760,7 @@ def fahrverhalten_werte() -> dict:
 FAHRWERT_GRENZEN = {
     "MIN_SPEED_DYN":         (0, 150),
     "MAX_SPEED_DYN":         (20, 255),
+    "GX_FORWARD_MAX":        (-0.40, 0.60),
     "GX_FULL_SPEED":         (-0.95, -0.30),
     "GY_LEFT_THRESHOLD":     (0.40, 0.95),
     "MAX_TURN_ANGLE_LEFT":   (10, 90),
@@ -765,6 +806,7 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     Rückgabe: Namen der tatsächlich geänderten Größen.
     """
     global MIN_SPEED_DYN, MAX_SPEED_DYN, GX_FULL_SPEED
+    global GX_FORWARD_MAX, GX_NEUTRAL_THRESHOLD
     global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
     global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
     global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
@@ -800,6 +842,10 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
 
     MIN_SPEED_DYN         = geprueft.get("MIN_SPEED_DYN", MIN_SPEED_DYN)
     MAX_SPEED_DYN         = geprueft.get("MAX_SPEED_DYN", MAX_SPEED_DYN)
+    GX_FORWARD_MAX        = round(geprueft.get("GX_FORWARD_MAX", GX_FORWARD_MAX), 2)
+    # Das Totband wird nicht gespeichert, sondern immer aus der Fahrschwelle
+    # abgeleitet - so kann es nicht mit ihr auseinanderlaufen.
+    GX_NEUTRAL_THRESHOLD  = round(GX_FORWARD_MAX + GX_TOTBAND, 2)
     GX_FULL_SPEED         = round(geprueft.get("GX_FULL_SPEED", GX_FULL_SPEED), 2)
     GY_LEFT_THRESHOLD     = round(geprueft.get("GY_LEFT_THRESHOLD", GY_LEFT_THRESHOLD), 3)
     MAX_TURN_ANGLE_LEFT   = geprueft.get("MAX_TURN_ANGLE_LEFT", MAX_TURN_ANGLE_LEFT)
@@ -5255,6 +5301,7 @@ class DrivingTuneWindow:
         self.var_tempo      = tk.DoubleVar(value=float(TURN_SPEED_FACTOR))
         self.var_zyklus     = tk.DoubleVar(value=float(ROLL_COMMAND_DURATION))
         self.var_vollgas    = tk.DoubleVar(value=abs(GX_FULL_SPEED))
+        self.var_fahrschwelle = tk.DoubleVar(value=float(GX_FORWARD_MAX))
         self.var_stoppzeit  = tk.DoubleVar(value=float(STOP_TIME))
         self.var_rueck_v    = tk.DoubleVar(value=float(BACKWARD_SPEED))
         self.var_rueck_t    = tk.DoubleVar(value=float(BACKWARD_DURATION))
@@ -5313,6 +5360,17 @@ class DrivingTuneWindow:
                   justify="left").pack(anchor="w", padx=(22, 0), pady=(0, 2))
 
         self._abschnitt(main, "1  Tempo geradeaus")
+        self._regler(main, "Fahrschwelle", self.var_fahrschwelle, -0.40, 0.60, 0.02,
+                     "hoeher = er faehrt schon bei fast waagerechter oder leicht "
+                     "angehobener Hand los; gut im Sitzen und bei eingeschraenkter "
+                     "Schulterbeweglichkeit",
+                     "tiefer = die Hand muss deutlich gesenkt werden, bevor er "
+                     "anfaehrt; er bleibt zuverlaessiger stehen",
+                     was="Neigung, ab der er losfaehrt. 0 ist die waagerechte Hand, "
+                         "positive Werte liegen darueber, negative darunter. Wirkt "
+                         "doppelt: Sie ist zugleich der obere Anschlag der Tempo-Rampe, "
+                         "ein hoeherer Wert streckt also auch den Weg bis zum "
+                         "Hoechsttempo.")
         self._regler(main, "Grundtempo", self.var_tempo_min, 0, 150, 1,
                      "hoeher = er rollt sofort zuegig los, kein sachtes Anfahren mehr",
                      "tiefer = die Fahrt beginnt ganz langsam und ist leichter zu "
@@ -5336,7 +5394,7 @@ class DrivingTuneWindow:
                          "anliegt. 0.95 ist fast senkrecht nach unten.")
 
         self._abschnitt(main, "2  Linkskurve")
-        self._regler(main, "Schwelle links", self.var_schwelle_l, 0.40, 0.95, 0.01,
+        self._regler(main, "Schwelle links", self.var_schwelle_l, 0.30, 0.95, 0.01,
                      "hoeher = die Hand muss weiter gedreht werden, bevor er ueberhaupt "
                      "lenkt; versehentliches Lenken wird seltener",
                      "tiefer = er lenkt schon bei leichter Drehung; leichter erreichbar, "
@@ -5356,7 +5414,7 @@ class DrivingTuneWindow:
                          "die Funkverbindung gerade sind.")
 
         self._abschnitt(main, "3  Rechtskurve")
-        self._regler(main, "Schwelle rechts", self.var_schwelle_r, 0.40, 0.95, 0.01,
+        self._regler(main, "Schwelle rechts", self.var_schwelle_r, 0.30, 0.95, 0.01,
                      "hoeher = die Hand muss weiter gedreht werden, bevor er ueberhaupt "
                      "lenkt; versehentliches Lenken wird seltener",
                      "tiefer = er lenkt schon bei leichter Drehung; leichter erreichbar, "
@@ -5697,6 +5755,7 @@ class DrivingTuneWindow:
 
     def _anwenden(self, profil: str):
         global MIN_SPEED_DYN, MAX_SPEED_DYN, GX_FULL_SPEED
+        global GX_FORWARD_MAX, GX_NEUTRAL_THRESHOLD
         global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
         global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
         global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
@@ -5717,8 +5776,24 @@ class DrivingTuneWindow:
             MIN_SPEED_DYN = MAX_SPEED_DYN
             self.var_tempo_min.set(MIN_SPEED_DYN)
 
+        # Fahrschwelle. Das Totband zur Neutralschwelle wird mitgefuehrt: Ohne
+        # das laege die Grenze zwischen Fahren und Stehen auf einem einzigen
+        # Wert, sobald die Fahrschwelle ueber die feste 0.12 gehoben wird.
+        GX_FORWARD_MAX        = round(float(self.var_fahrschwelle.get()), 2)
+        GX_NEUTRAL_THRESHOLD  = round(GX_FORWARD_MAX + GX_TOTBAND, 2)
+
         # Vollgas liegt bei gesenkter Hand, also im Negativen.
         GX_FULL_SPEED         = -round(abs(float(self.var_vollgas.get())), 2)
+
+        # Die Tempo-Rampe laeuft von der Fahrschwelle bis zur Vollgas-Neigung.
+        # Faellt die Fahrschwelle unter die Vollgas-Neigung, kehrt sich die
+        # Rampe um: Je weiter die Hand gesenkt wird, desto LANGSAMER fuehre er.
+        # Der Regler wird auf den geklemmten Wert zurueckgesetzt, damit Anzeige
+        # und Verhalten nicht auseinanderlaufen.
+        if GX_FORWARD_MAX <= GX_FULL_SPEED:
+            GX_FORWARD_MAX       = round(GX_FULL_SPEED + 0.10, 2)
+            GX_NEUTRAL_THRESHOLD = round(GX_FORWARD_MAX + GX_TOTBAND, 2)
+            self.var_fahrschwelle.set(GX_FORWARD_MAX)
         GY_LEFT_THRESHOLD     = round(abs(float(self.var_schwelle_l.get())), 3)
         MAX_TURN_ANGLE_LEFT   = int(round(float(self.var_winkel_l.get())))
         # rechts wird als negativer Wert geführt (Kippen in die Gegenrichtung)
@@ -5823,6 +5898,7 @@ class DrivingTuneWindow:
             self.var_tempo_min.set(MIN_SPEED_DYN)
             self.var_tempo_max.set(MAX_SPEED_DYN)
             self.var_vollgas.set(abs(GX_FULL_SPEED))
+            self.var_fahrschwelle.set(GX_FORWARD_MAX)
             self.var_schwelle_l.set(abs(GY_LEFT_THRESHOLD))
             self.var_winkel_l.set(MAX_TURN_ANGLE_LEFT)
             self.var_schwelle_r.set(abs(GY_RIGHT_THRESHOLD))
@@ -5865,6 +5941,7 @@ class DrivingTuneWindow:
     def _werte_text(self) -> str:
         return (f"MIN_SPEED_DYN         = {MIN_SPEED_DYN}\n"
                 f"MAX_SPEED_DYN         = {MAX_SPEED_DYN}\n"
+                f"GX_FORWARD_MAX        = {GX_FORWARD_MAX:+.2f}\n"
                 f"GX_FULL_SPEED         = {GX_FULL_SPEED:+.2f}\n"
                 f"GY_LEFT_THRESHOLD     = {GY_LEFT_THRESHOLD:+.2f}\n"
                 f"MAX_TURN_ANGLE_LEFT   = {MAX_TURN_ANGLE_LEFT}\n"
