@@ -170,7 +170,7 @@ graph_time_values = deque(maxlen=MAX_POINTS)
 # gefahren werden kann, ohne dass am Code etwas geändert werden muss.
 MIN_SPEED_DYN        = 30
 MAX_SPEED_DYN        = 120
-TURN_SPEED_FACTOR    = 0.6
+TURN_SPEED_FACTOR    = 0.2
 
 # Handneigung, bei der das Höchsttempo erreicht ist (Hand weit nach unten
 # gekippt). Zusammen mit GX_FORWARD_MAX spannt dieser Wert die Tempo-Rampe auf:
@@ -188,7 +188,7 @@ GX_FULL_SPEED        = -0.95
 # Kleiner = der Sphero bleibt schneller stehen, wenn die Hand zurückgenommen
 # wird. Zu klein sollte er nicht sein, sonst löst jedes Wackeln um die
 # Neutralschwelle ein Stopp/Start-Paar aus.
-STOP_TIME            = 0.6
+STOP_TIME            = 0.3
 
 # Kippschwellen für die Drehung. Der Betrag der Schwelle ist zugleich der
 # Punkt, ab dem calc_turn() zu drehen beginnt (siehe dort).
@@ -197,6 +197,32 @@ STOP_TIME            = 0.6
 # die andere. Wer stattdessen symmetrisch fahren möchte, setzt beide auf 0.80.
 GY_RIGHT_THRESHOLD   = -0.38
 GY_LEFT_THRESHOLD    = +0.40
+
+# Handdrehung, bei der der volle Lenkwinkel anliegt - je Seite getrennt.
+#
+# Bisher stand hier fest die 1.00, also die vollstaendig auf die Seite gedrehte
+# Hand. Das ist dieselbe Annahme, die bei der Neigung schon einmal falsch war
+# (siehe GX_FULL_SPEED): Wer den Bereich nicht ausschoepfen kann, erreicht den
+# vollen Winkel nie und lenkt dauerhaft nur mit einem Bruchteil.
+#
+# Bei der Drehung ist das keine Vermutung, sondern gemessen. Aus den
+# aufgezeichneten sensor.csv der Sitzungen P05 bis P16 (Anteil des nutzbaren
+# Bereichs, den die Testpersonen tatsaechlich erreicht haben):
+#
+#     Uhr am LINKEN Arm  (5 Sitzungen): links 99 %, rechts 95 %
+#     Uhr am RECHTEN Arm (9 Sitzungen): links 88 %, rechts 98 %
+#
+# Einzelne Personen mit Uhr rechts kamen links nur auf 64 bis 66 %. Der Grund
+# ist anatomisch: Unterarmdrehung nach aussen und nach innen haben nicht
+# denselben Bewegungsumfang, und welche Richtung die kuerzere ist, haengt am
+# getragenen Arm - korrigiere_tragearm dreht das Vorzeichen mit, die
+# Bewegungseinschraenkung wandert dadurch auf die andere Seite.
+#
+# Wird der Wert auf die tatsaechlich erreichte Drehung gesetzt, steht der volle
+# Lenkwinkel wieder ueber den ganzen individuellen Bewegungsumfang zur
+# Verfuegung. 1.00 verhaelt sich wie bisher.
+GY_FULL_LEFT         = 0.88
+GY_FULL_RIGHT        = 1.00
 # Fahrschwelle: Ab dieser Neigung faehrt der Sphero los.
 #
 # gx ist positiv bei angehobener und negativ bei gesenkter Hand. Gefahren wird,
@@ -226,7 +252,7 @@ GY_LEFT_THRESHOLD    = +0.40
 # Beide Groessen beschreiben denselben nutzbaren Neigungsbereich und duerfen
 # nicht auseinanderlaufen; deshalb dieselbe Konstante fuer Zustandserkennung
 # und Temporampe.
-GX_FORWARD_MAX       = +0.35
+GX_FORWARD_MAX       = +0.34
 
 # Obere Kante des Totbands zwischen Fahren und Stehen. Wird automatisch mit der
 # Fahrschwelle mitgefuehrt (siehe DrivingTuneWindow._anwenden), damit das
@@ -249,8 +275,8 @@ GX_TOTBAND = 0.02
 # "Je Lenkschritt" heißt seit der Umstellung auf die zeitbasierte Drehrate:
 # je LENK_BEZUGSTAKT_S Sekunden (siehe dort), NICHT mehr je tatsächlichem
 # Schleifendurchlauf.
-MAX_TURN_ANGLE_RIGHT = 65
-MAX_TURN_ANGLE_LEFT  = 65
+MAX_TURN_ANGLE_RIGHT = 64
+MAX_TURN_ANGLE_LEFT  = 64
 
 # ── Zeitbasierte Drehrate ────────────────────────────────────────────────────
 # Taktzeit, auf die sich MAX_TURN_ANGLE_* bezieht.
@@ -277,7 +303,7 @@ MAX_TURN_ANGLE_LEFT  = 65
 # quittierte BLE-Pakete je Durchlauf plus deren Sicherheitsabstände). Der Wert
 # ist deshalb so gewählt, dass die eingefahrene Abstimmung erhalten bleibt.
 # Kleiner = dreht insgesamt schneller, größer = gemächlicher.
-LENK_BEZUGSTAKT_S = 0.22
+LENK_BEZUGSTAKT_S = 0.3
 
 # Obergrenze des Zeitfaktors dt / LENK_BEZUGSTAKT_S. Hängt die Schleife einmal
 # (Funkaussetzer, kurz blockierte Kamera), würde die "nachzuholende" Drehung
@@ -390,7 +416,7 @@ LENK_EXPO = 1.0
 # mit der sich Kurven am leichtesten treffen ließen – Tempo und Kurvenradius
 # passen dann von selbst zusammen, statt dass zum Kurvenfahren abgebremst
 # werden muss.
-LENK_TEMPO_KOPPLUNG = 1.0
+LENK_TEMPO_KOPPLUNG = 0.2
 
 # ── Glättung der Handhaltung ─────────────────────────────────────────────────
 # Zeitkonstante eines Tiefpasses erster Ordnung auf gx und gy. 0 schaltet die
@@ -563,7 +589,7 @@ WATCH_ARM_LEFT  = "links"
 WATCH_ARM_RIGHT = "rechts"
 watch_arm = WATCH_ARM_LEFT        # zur Laufzeit über die Oberfläche umschaltbar
 
-ROLL_COMMAND_DURATION = 0.06   # Sekunden – Hauptanteil des angestrebten Takts
+ROLL_COMMAND_DURATION = 0.05   # Sekunden – Hauptanteil des angestrebten Takts
 CONTROL_LOOP_SLEEP    = 0.04   # Sekunden – Restanteil des angestrebten Takts
 BACKWARD_DURATION = 2.0   # Sekunden Rückwärtsfahrt pro Double Tap
 BACKWARD_SPEED    = 50    # Geschwindigkeit während der Rückwärtsfahrt
@@ -638,15 +664,15 @@ FAHRPROFILE = {
     # wann der Halt als endgueltig gilt.
     "Sanft": {
         "MIN_SPEED_DYN": 20, "MAX_SPEED_DYN": 80,
-        "TURN_SPEED_FACTOR": 0.5,
-        "MAX_TURN_ANGLE_LEFT": 80, "MAX_TURN_ANGLE_RIGHT": 80,
-        "ROLL_COMMAND_DURATION": 0.04, "STOP_TIME": 0.6,
+        "TURN_SPEED_FACTOR": 0.2,
+        "MAX_TURN_ANGLE_LEFT": 64, "MAX_TURN_ANGLE_RIGHT": 64,
+        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.3,
         "BACKWARD_SPEED": 50,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 90, "POS_MAX_OFFSET_RIGHT": 90,
         "GLAETTUNG_TAU_S": 0.05, "GY_HYSTERESE": 0.08, "GX_HYSTERESE": 0.01,
-        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
-        "LENK_BEZUGSTAKT_S": 0.36, "LENK_MAX_DREHUNG": 0,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 0.2,
+        "LENK_BEZUGSTAKT_S": 0.3, "LENK_MAX_DREHUNG": 0,
     },
 
     # Der in den Testfahrten mit P05-P07 eingefahrene Stand.
@@ -669,15 +695,15 @@ FAHRPROFILE = {
     # Person; die Vorgabe steht oben bei GY_LEFT_THRESHOLD.
     "Standard": {
         "MIN_SPEED_DYN": 30, "MAX_SPEED_DYN": 120,
-        "TURN_SPEED_FACTOR": 0.5,
-        "MAX_TURN_ANGLE_LEFT": 65, "MAX_TURN_ANGLE_RIGHT": 65,
-        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.5,
+        "TURN_SPEED_FACTOR": 0.2,
+        "MAX_TURN_ANGLE_LEFT": 64, "MAX_TURN_ANGLE_RIGHT": 64,
+        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.3,
         "BACKWARD_SPEED": 50,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 60, "POS_MAX_OFFSET_RIGHT": 60,
-        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
-        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
-        "LENK_BEZUGSTAKT_S": 0.30, "LENK_MAX_DREHUNG": 0,
+        "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.12, "GX_HYSTERESE": 0.0,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 0.2,
+        "LENK_BEZUGSTAKT_S": 0.3, "LENK_MAX_DREHUNG": 0,
     },
 
     # Fuer Testpersonen, die sich sicher fuehlen und mehr Tempo wollen.
@@ -698,14 +724,14 @@ FAHRPROFILE = {
     # empfindlicher auf kurzes Anheben der Hand.
     "Sportlich": {
         "MIN_SPEED_DYN": 45, "MAX_SPEED_DYN": 150,
-        "TURN_SPEED_FACTOR": 0.5,
-        "MAX_TURN_ANGLE_LEFT": 90, "MAX_TURN_ANGLE_RIGHT": 90,
-        "ROLL_COMMAND_DURATION": 0.04, "STOP_TIME": 0.3,
-        "BACKWARD_SPEED": 80,
+        "TURN_SPEED_FACTOR": 0.2,
+        "MAX_TURN_ANGLE_LEFT": 64, "MAX_TURN_ANGLE_RIGHT": 64,
+        "ROLL_COMMAND_DURATION": 0.05, "STOP_TIME": 0.3,
+        "BACKWARD_SPEED": 50,
         "STEUERMODUS": "rate",
         "POS_MAX_OFFSET_LEFT": 70, "POS_MAX_OFFSET_RIGHT": 70,
         "GLAETTUNG_TAU_S": 0.0, "GY_HYSTERESE": 0.0, "GX_HYSTERESE": 0.0,
-        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 1.0,
+        "LENK_EXPO": 1.0, "LENK_TEMPO_KOPPLUNG": 0.2,
         "LENK_BEZUGSTAKT_S": 0.3, "LENK_MAX_DREHUNG": 0,
     },
 }
@@ -732,6 +758,8 @@ def fahrverhalten_werte() -> dict:
         "GX_FORWARD_MAX": GX_FORWARD_MAX,
         "GX_FULL_SPEED": GX_FULL_SPEED,
         "GY_LEFT_THRESHOLD": GY_LEFT_THRESHOLD,
+        "GY_FULL_LEFT": GY_FULL_LEFT,
+        "GY_FULL_RIGHT": GY_FULL_RIGHT,
         "MAX_TURN_ANGLE_LEFT": MAX_TURN_ANGLE_LEFT,
         "GY_RIGHT_THRESHOLD": GY_RIGHT_THRESHOLD,
         "MAX_TURN_ANGLE_RIGHT": MAX_TURN_ANGLE_RIGHT,
@@ -763,6 +791,8 @@ FAHRWERT_GRENZEN = {
     "GX_FORWARD_MAX":        (-0.40, 0.60),
     "GX_FULL_SPEED":         (-0.95, -0.30),
     "GY_LEFT_THRESHOLD":     (0.40, 0.95),
+    "GY_FULL_LEFT":          (0.50, 1.00),
+    "GY_FULL_RIGHT":         (0.50, 1.00),
     "MAX_TURN_ANGLE_LEFT":   (10, 90),
     "GY_RIGHT_THRESHOLD":    (-0.95, -0.40),
     "MAX_TURN_ANGLE_RIGHT":  (10, 90),
@@ -807,6 +837,7 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     """
     global MIN_SPEED_DYN, MAX_SPEED_DYN, GX_FULL_SPEED
     global GX_FORWARD_MAX, GX_NEUTRAL_THRESHOLD
+    global GY_FULL_LEFT, GY_FULL_RIGHT
     global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
     global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
     global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
@@ -847,6 +878,8 @@ def fahrverhalten_anwenden(werte: dict, profil: str = None) -> list:
     # abgeleitet - so kann es nicht mit ihr auseinanderlaufen.
     GX_NEUTRAL_THRESHOLD  = round(GX_FORWARD_MAX + GX_TOTBAND, 2)
     GX_FULL_SPEED         = round(geprueft.get("GX_FULL_SPEED", GX_FULL_SPEED), 2)
+    GY_FULL_LEFT          = round(geprueft.get("GY_FULL_LEFT", GY_FULL_LEFT), 2)
+    GY_FULL_RIGHT         = round(geprueft.get("GY_FULL_RIGHT", GY_FULL_RIGHT), 2)
     GY_LEFT_THRESHOLD     = round(geprueft.get("GY_LEFT_THRESHOLD", GY_LEFT_THRESHOLD), 3)
     MAX_TURN_ANGLE_LEFT   = geprueft.get("MAX_TURN_ANGLE_LEFT", MAX_TURN_ANGLE_LEFT)
     GY_RIGHT_THRESHOLD    = round(geprueft.get("GY_RIGHT_THRESHOLD", GY_RIGHT_THRESHOLD), 3)
@@ -1076,6 +1109,10 @@ def _drehanteil(gy_value) -> float:
     Wie weit die Hand über die Kippschwelle hinaus gedreht ist: 0 an der
     Schwelle, 1 bei vollem Ausschlag.
 
+    "Voller Ausschlag" ist GY_FULL_LEFT bzw. GY_FULL_RIGHT und damit je Seite
+    einstellbar – nicht mehr fest die komplett gedrehte Hand. Wer eine Seite
+    anatomisch nicht so weit dreht, erreichte sonst den vollen Lenkwinkel nie.
+
     Der Nullpunkt ist die Schwelle DERSELBEN Seite. Vorher stand hier eine
     gemeinsame Konstante (TURN_DEADZONE = 0.80). Solange beide Schwellen bei
     0.80 lagen, war das gleichwertig – sobald die linke Schwelle aber tiefer
@@ -1089,7 +1126,10 @@ def _drehanteil(gy_value) -> float:
     """
     links     = gy_value > 0
     threshold = abs(GY_LEFT_THRESHOLD) if links else abs(GY_RIGHT_THRESHOLD)
-    span      = max(1.0 - threshold, 1e-6)
+    # Oberes Ende der Kennlinie: nicht mehr fest 1.00, sondern die Drehung, die
+    # auf dieser Seite tatsaechlich erreicht wird (siehe GY_FULL_LEFT).
+    vollaus   = abs(GY_FULL_LEFT) if links else abs(GY_FULL_RIGHT)
+    span      = max(vollaus - threshold, 1e-6)
     intensity = (abs(gy_value) - threshold) / span
     anteil    = max(0.0, min(1.0, intensity))
     # Kennlinie spreizen: Bei LENK_EXPO > 1 wirken kleine Handdrehungen
@@ -5295,8 +5335,10 @@ class DrivingTuneWindow:
         self.var_tempo_min  = tk.DoubleVar(value=float(MIN_SPEED_DYN))
         self.var_tempo_max  = tk.DoubleVar(value=float(MAX_SPEED_DYN))
         self.var_schwelle_l = tk.DoubleVar(value=abs(GY_LEFT_THRESHOLD))
+        self.var_vollaus_l  = tk.DoubleVar(value=abs(GY_FULL_LEFT))
         self.var_winkel_l   = tk.DoubleVar(value=float(MAX_TURN_ANGLE_LEFT))
         self.var_schwelle_r = tk.DoubleVar(value=abs(GY_RIGHT_THRESHOLD))
+        self.var_vollaus_r  = tk.DoubleVar(value=abs(GY_FULL_RIGHT))
         self.var_winkel_r   = tk.DoubleVar(value=float(MAX_TURN_ANGLE_RIGHT))
         self.var_tempo      = tk.DoubleVar(value=float(TURN_SPEED_FACTOR))
         self.var_zyklus     = tk.DoubleVar(value=float(ROLL_COMMAND_DURATION))
@@ -5394,13 +5436,23 @@ class DrivingTuneWindow:
                          "anliegt. 0.95 ist fast senkrecht nach unten.")
 
         self._abschnitt(main, "2  Linkskurve")
-        self._regler(main, "Schwelle links", self.var_schwelle_l, 0.30, 0.95, 0.01,
+        self._regler(main, "Schwelle links", self.var_schwelle_l, 0.20, 0.95, 0.01,
                      "hoeher = die Hand muss weiter gedreht werden, bevor er ueberhaupt "
                      "lenkt; versehentliches Lenken wird seltener",
                      "tiefer = er lenkt schon bei leichter Drehung; leichter erreichbar, "
                      "aber auch schneller ungewollt ausgeloest",
                      was="Ab welcher Handdrehung die Linkskurve beginnt. Darunter faehrt "
                          "er geradeaus. 1.00 waere die Hand komplett auf der Seite.")
+        self._regler(main, "Vollausschlag links", self.var_vollaus_l, 0.50, 1.00, 0.02,
+                     "hoeher = der volle Lenkwinkel kommt erst bei weit gedrehter Hand; "
+                     "feiner dosierbar, aber schwerer ganz auszureizen",
+                     "tiefer = der volle Lenkwinkel ist schon bei maessiger Drehung "
+                     "erreicht; hilft, wenn diese Seite anatomisch nicht so weit geht",
+                     was="Handdrehung, bei der der VOLLE Lenkwinkel anliegt. Wer die Hand auf "
+                         "dieser Seite anatomisch nicht ganz herumdreht, erreicht mit "
+                         "1.00 nie die volle Lenkung. Auf den Wert stellen, den die "
+                         "Testperson bequem erreicht - die Live-Anzeige unten zeigt "
+                         "die aktuelle Drehung.")
         self._regler(main, "Max. Winkel links", self.var_winkel_l, 10, 90, 1,
                      "hoeher = er dreht sich bei voller Handdrehung sehr schnell; gut "
                      "zum Wenden, aber schwerer fein zu dosieren",
@@ -5422,6 +5474,16 @@ class DrivingTuneWindow:
                      was="Ab welcher Handdrehung die Rechtskurve beginnt. Darf sich von "
                          "der linken Schwelle unterscheiden – die Drehung faellt in eine "
                          "Richtung anatomisch schwerer.")
+        self._regler(main, "Vollausschlag rechts", self.var_vollaus_r, 0.50, 1.00, 0.02,
+                     "hoeher = der volle Lenkwinkel kommt erst bei weit gedrehter Hand; "
+                     "feiner dosierbar, aber schwerer ganz auszureizen",
+                     "tiefer = der volle Lenkwinkel ist schon bei maessiger Drehung "
+                     "erreicht; hilft, wenn diese Seite anatomisch nicht so weit geht",
+                     was="Handdrehung, bei der der VOLLE Lenkwinkel anliegt. Wer die Hand auf "
+                         "dieser Seite anatomisch nicht ganz herumdreht, erreicht mit "
+                         "1.00 nie die volle Lenkung. Auf den Wert stellen, den die "
+                         "Testperson bequem erreicht - die Live-Anzeige unten zeigt "
+                         "die aktuelle Drehung.")
         self._regler(main, "Max. Winkel rechts", self.var_winkel_r, 10, 90, 1,
                      "hoeher = er dreht sich bei voller Handdrehung sehr schnell; gut "
                      "zum Wenden, aber schwerer fein zu dosieren",
@@ -5758,6 +5820,7 @@ class DrivingTuneWindow:
         global GX_FORWARD_MAX, GX_NEUTRAL_THRESHOLD
         global GY_LEFT_THRESHOLD, MAX_TURN_ANGLE_LEFT
         global GY_RIGHT_THRESHOLD, MAX_TURN_ANGLE_RIGHT
+        global GY_FULL_LEFT, GY_FULL_RIGHT
         global TURN_SPEED_FACTOR, ROLL_COMMAND_DURATION
         global STOP_TIME, BACKWARD_SPEED, BACKWARD_DURATION
         global GLAETTUNG_TAU_S, GY_HYSTERESE, GX_HYSTERESE
@@ -5782,6 +5845,19 @@ class DrivingTuneWindow:
         GX_FORWARD_MAX        = round(float(self.var_fahrschwelle.get()), 2)
         GX_NEUTRAL_THRESHOLD  = round(GX_FORWARD_MAX + GX_TOTBAND, 2)
 
+        # Der Vollausschlag muss ueber der Kippschwelle derselben Seite
+        # liegen, und zwar mit Abstand. Ohne diesen Mindestabstand wuerde die
+        # Kennlinie in _drehanteil auf einem Haar zusammenschnurren: Ein
+        # Hauch ueber der Schwelle laege sofort der volle Lenkwinkel an, die
+        # Lenkung waere nicht mehr dosierbar, sondern ein Schalter.
+        MINDESTSPANNE = 0.15
+        if GY_FULL_LEFT < GY_LEFT_THRESHOLD + MINDESTSPANNE:
+            GY_FULL_LEFT = round(GY_LEFT_THRESHOLD + MINDESTSPANNE, 2)
+            self.var_vollaus_l.set(GY_FULL_LEFT)
+        if GY_FULL_RIGHT < abs(GY_RIGHT_THRESHOLD) + MINDESTSPANNE:
+            GY_FULL_RIGHT = round(abs(GY_RIGHT_THRESHOLD) + MINDESTSPANNE, 2)
+            self.var_vollaus_r.set(GY_FULL_RIGHT)
+
         # Vollgas liegt bei gesenkter Hand, also im Negativen.
         GX_FULL_SPEED         = -round(abs(float(self.var_vollgas.get())), 2)
 
@@ -5794,6 +5870,10 @@ class DrivingTuneWindow:
             GX_FORWARD_MAX       = round(GX_FULL_SPEED + 0.10, 2)
             GX_NEUTRAL_THRESHOLD = round(GX_FORWARD_MAX + GX_TOTBAND, 2)
             self.var_fahrschwelle.set(GX_FORWARD_MAX)
+        # Vollausschlag zuerst, damit die Klemmung unten gegen den bereits
+        # uebernommenen Wert prueft.
+        GY_FULL_LEFT          = round(abs(float(self.var_vollaus_l.get())), 2)
+        GY_FULL_RIGHT         = round(abs(float(self.var_vollaus_r.get())), 2)
         GY_LEFT_THRESHOLD     = round(abs(float(self.var_schwelle_l.get())), 3)
         MAX_TURN_ANGLE_LEFT   = int(round(float(self.var_winkel_l.get())))
         # rechts wird als negativer Wert geführt (Kippen in die Gegenrichtung)
@@ -5899,6 +5979,8 @@ class DrivingTuneWindow:
             self.var_tempo_max.set(MAX_SPEED_DYN)
             self.var_vollgas.set(abs(GX_FULL_SPEED))
             self.var_fahrschwelle.set(GX_FORWARD_MAX)
+            self.var_vollaus_l.set(abs(GY_FULL_LEFT))
+            self.var_vollaus_r.set(abs(GY_FULL_RIGHT))
             self.var_schwelle_l.set(abs(GY_LEFT_THRESHOLD))
             self.var_winkel_l.set(MAX_TURN_ANGLE_LEFT)
             self.var_schwelle_r.set(abs(GY_RIGHT_THRESHOLD))
@@ -5944,6 +6026,8 @@ class DrivingTuneWindow:
                 f"GX_FORWARD_MAX        = {GX_FORWARD_MAX:+.2f}\n"
                 f"GX_FULL_SPEED         = {GX_FULL_SPEED:+.2f}\n"
                 f"GY_LEFT_THRESHOLD     = {GY_LEFT_THRESHOLD:+.2f}\n"
+                f"GY_FULL_LEFT          = {GY_FULL_LEFT:.2f}\n"
+                f"GY_FULL_RIGHT         = {GY_FULL_RIGHT:.2f}\n"
                 f"MAX_TURN_ANGLE_LEFT   = {MAX_TURN_ANGLE_LEFT}\n"
                 f"GY_RIGHT_THRESHOLD    = {GY_RIGHT_THRESHOLD:+.2f}\n"
                 f"MAX_TURN_ANGLE_RIGHT  = {MAX_TURN_ANGLE_RIGHT}\n"
